@@ -1,11 +1,17 @@
 {
     "name": "wlrdp",
+    "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "24"
+    }
+  },
     "build": {
         "dockerfile": "Dockerfile",
         "context": ".."
     },
     "workspaceFolder": "/workspace",
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "postCreateCommand": "npm install -g @anthropic-ai/claude-code",
     "customizations": {
         "vscode": {
             "extensions": [
@@ -18,5 +24,8 @@
             }
         }
     },
-    "remoteUser": "developer"
+    "remoteUser": "developer",
+    "mounts": [
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.claude,target=/home/developer/.claude,type=bind"
+    ]
 }
