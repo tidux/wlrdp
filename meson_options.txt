@@ -1,0 +1,4 @@
+option('enable-h264', type: 'feature', value: 'disabled',
+    description: 'H.264 encoding via FFmpeg (Phase 3)')
+option('enable-pipewire', type: 'feature', value: 'disabled',
+    description: 'PipeWire capture and audio (Phase 3+)')
