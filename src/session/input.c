@@ -100,6 +100,7 @@ static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version)
 {
+    (void)version;
     struct wlrdp_input *inp = data;
 
     if (strcmp(interface, "zwlr_virtual_pointer_manager_v1") == 0) {

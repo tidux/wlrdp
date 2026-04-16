@@ -31,8 +31,8 @@ Three-tier architecture:
       └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
              v                v                v
       ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-      │    cage       │ │    cage       │ │    cage       │
-      │ (compositor)  │ │ (compositor)  │ │ (compositor)  │
+      │    cage      │ │    cage      │ │    cage      │
+      │ (compositor) │ │ (compositor) │ │ (compositor) │
       └──────────────┘ └──────────────┘ └──────────────┘
 ```
 

@@ -62,7 +62,7 @@ static bool alloc_buffer(struct wlrdp_capture *cap,
         return false;
     }
 
-    cap->pool = wl_shm_pool_create(cap->shm, cap->shm_fd, cap->buf_size);
+    cap->pool = wl_shm_create_pool(cap->shm, cap->shm_fd, cap->buf_size);
     cap->buffer = wl_shm_pool_create_buffer(cap->pool, 0,
                                              width, height, stride,
                                              WL_SHM_FORMAT_XRGB8888);
@@ -152,6 +152,7 @@ static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version)
 {
+    (void)version;
     struct wlrdp_capture *cap = data;
 
     if (strcmp(interface, "zwlr_screencopy_manager_v1") == 0) {

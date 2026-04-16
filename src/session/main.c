@@ -252,10 +252,10 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    DWORD count = 0;
-    HANDLE *handles = srv.listener->GetEventHandles(srv.listener, &count);
+    HANDLE events[32];
+    DWORD count = srv.listener->GetEventHandles(srv.listener, events, 32);
     for (DWORD i = 0; i < count; i++) {
-        int fd = GetEventFileDescriptor(handles[i]);
+        int fd = GetEventFileDescriptor(events[i]);
         if (fd >= 0) {
             epoll_add_fd(srv.epoll_fd, fd);
         }
