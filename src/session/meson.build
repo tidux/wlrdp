@@ -3,4 +3,5 @@ session_sources = files(
     'capture.c',
     'input.c',
     'encoder.c',
+    'rdp_peer.c',
 )
