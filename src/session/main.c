@@ -1,4 +1,5 @@
 #include "common.h"
+#include "ipc.h"
 #include "compositor.h"
 #include "capture.h"
 #include "input.h"
@@ -28,12 +29,13 @@ struct wlrdp_server {
     const char *desktop_cmd;
     const char *cert_file;
     const char *key_file;
+    int ipc_fd;          /* -1 for standalone mode */
 
     struct wlrdp_compositor comp;
     struct wlrdp_capture capture;
     struct wlrdp_input input;
     struct wlrdp_encoder encoder;
-    freerdp_listener *listener;
+    freerdp_listener *listener; /* NULL in IPC mode */
     freerdp_peer *client;
 
     int epoll_fd;
@@ -65,7 +67,6 @@ static void on_frame_ready(void *data, uint8_t *pixels,
 
     if (!srv->client_active || !srv->client) return;
 
-    /* Throttle: skip frame if too soon */
     uint64_t now = now_ms();
     if (now - srv->last_frame_ms < FRAME_MIN_INTERVAL_MS) {
         capture_request_frame(&srv->capture);
@@ -90,6 +91,89 @@ static void on_frame_ready(void *data, uint8_t *pixels,
                         width, height);
 
     capture_request_frame(&srv->capture);
+}
+
+static void disconnect_client(struct wlrdp_server *srv)
+{
+    if (srv->client) {
+        freerdp_peer_context_free(srv->client);
+        freerdp_peer_free(srv->client);
+        srv->client = NULL;
+        srv->client_active = false;
+        WLRDP_LOG_INFO("client disconnected");
+    }
+
+    /* In IPC mode, notify daemon and wait for reconnect. */
+    if (srv->ipc_fd >= 0) {
+        struct wlrdp_ipc_msg msg = {
+            .type = WLRDP_MSG_STATUS,
+            .payload_len = 4,
+        };
+        uint32_t status = WLRDP_STATUS_DISCONNECTED;
+        memcpy(msg.payload, &status, 4);
+        ipc_send_msg(srv->ipc_fd, &msg, -1);
+    }
+}
+
+static bool accept_ipc_client(struct wlrdp_server *srv)
+{
+    struct wlrdp_ipc_msg msg;
+    int peer_fd = -1;
+
+    if (!ipc_recv_msg(srv->ipc_fd, &msg, &peer_fd)) {
+        WLRDP_LOG_ERROR("IPC recv failed — daemon gone?");
+        g_running = 0;
+        return false;
+    }
+
+    if (msg.type == WLRDP_MSG_SHUTDOWN) {
+        WLRDP_LOG_INFO("received shutdown from daemon");
+        g_running = 0;
+        return false;
+    }
+
+    if (msg.type != WLRDP_MSG_NEW_CLIENT || peer_fd < 0) {
+        WLRDP_LOG_WARN("unexpected IPC message type %u", msg.type);
+        if (peer_fd >= 0) close(peer_fd);
+        return false;
+    }
+
+    /* Disconnect any existing client first */
+    disconnect_client(srv);
+
+    WLRDP_LOG_INFO("received new client fd %d from daemon", peer_fd);
+
+    freerdp_peer *client = freerdp_peer_new(peer_fd);
+    if (!client) {
+        WLRDP_LOG_ERROR("freerdp_peer_new failed");
+        close(peer_fd);
+        return false;
+    }
+
+    client->ContextSize = sizeof(struct wlrdp_peer_context);
+    if (!freerdp_peer_context_new(client)) {
+        WLRDP_LOG_ERROR("freerdp_peer_context_new failed");
+        freerdp_peer_free(client);
+        return false;
+    }
+
+    if (!rdp_peer_init(client, srv->cert_file, srv->key_file, &srv->input)) {
+        WLRDP_LOG_ERROR("rdp_peer_init failed");
+        freerdp_peer_context_free(client);
+        freerdp_peer_free(client);
+        return false;
+    }
+
+    if (!client->Initialize(client)) {
+        WLRDP_LOG_ERROR("peer Initialize failed");
+        freerdp_peer_context_free(client);
+        freerdp_peer_free(client);
+        return false;
+    }
+
+    srv->client = client;
+    WLRDP_LOG_INFO("IPC client initialized");
+    return true;
 }
 
 static BOOL on_peer_accepted(freerdp_listener *listener,
@@ -126,7 +210,6 @@ static BOOL on_peer_accepted(freerdp_listener *listener,
 
     srv->client = client;
     WLRDP_LOG_INFO("RDP client accepted");
-
     return TRUE;
 }
 
@@ -159,9 +242,10 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  --port PORT          RDP listen port (default: 3389)\n"
-        "  --width WIDTH        Display width (default: 1920)\n"
-        "  --height HEIGHT      Display height (default: 1080)\n"
+        "  --port PORT          RDP listen port (standalone mode, default: 3389)\n"
+        "  --ipc-fd FD          IPC socket fd (daemon mode)\n"
+        "  --width WIDTH        Display width (default: 800)\n"
+        "  --height HEIGHT      Display height (default: 600)\n"
         "  --desktop-cmd CMD    Command to run inside cage (default: foot)\n"
         "  --cert FILE          TLS certificate file\n"
         "  --key FILE           TLS private key file\n"
@@ -178,10 +262,12 @@ int main(int argc, char *argv[])
         .desktop_cmd = "foot",
         .cert_file = NULL,
         .key_file = NULL,
+        .ipc_fd = -1,
     };
 
     static struct option long_opts[] = {
         { "port",        required_argument, NULL, 'p' },
+        { "ipc-fd",      required_argument, NULL, 'i' },
         { "width",       required_argument, NULL, 'W' },
         { "height",      required_argument, NULL, 'H' },
         { "desktop-cmd", required_argument, NULL, 'd' },
@@ -192,10 +278,11 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:W:H:d:c:k:h",
+    while ((opt = getopt_long(argc, argv, "p:i:W:H:d:c:k:h",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': srv.port = atoi(optarg); break;
+        case 'i': srv.ipc_fd = atoi(optarg); break;
         case 'W': srv.width = atoi(optarg); break;
         case 'H': srv.height = atoi(optarg); break;
         case 'd': srv.desktop_cmd = optarg; break;
@@ -206,9 +293,18 @@ int main(int argc, char *argv[])
         }
     }
 
+    bool standalone = (srv.ipc_fd < 0);
+
+    if (standalone) {
+        WLRDP_LOG_INFO("running in standalone mode (no daemon)");
+    } else {
+        WLRDP_LOG_INFO("running in IPC mode (fd=%d)", srv.ipc_fd);
+    }
+
+    /* Auto-generate cert only in standalone mode */
     static char auto_cert[] = "/tmp/wlrdp-cert.pem";
     static char auto_key[] = "/tmp/wlrdp-key.pem";
-    if (!srv.cert_file || !srv.key_file) {
+    if (standalone && (!srv.cert_file || !srv.key_file)) {
         generate_self_signed_cert(auto_cert, auto_key);
         if (!srv.cert_file) srv.cert_file = auto_cert;
         if (!srv.key_file) srv.key_file = auto_key;
@@ -251,48 +347,52 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    srv.listener = freerdp_listener_new();
-    if (!srv.listener) {
-        WLRDP_LOG_ERROR("freerdp_listener_new failed");
-        encoder_destroy(&srv.encoder);
-        input_destroy(&srv.input);
-        capture_destroy(&srv.capture);
-        compositor_destroy(&srv.comp);
-        return 1;
-    }
-
-    srv.listener->info = &srv;
-    srv.listener->PeerAccepted = on_peer_accepted;
-
-    if (!srv.listener->Open(srv.listener, "0.0.0.0", srv.port)) {
-        WLRDP_LOG_ERROR("failed to listen on port %d", srv.port);
-        freerdp_listener_free(srv.listener);
-        encoder_destroy(&srv.encoder);
-        input_destroy(&srv.input);
-        capture_destroy(&srv.capture);
-        compositor_destroy(&srv.comp);
-        return 1;
-    }
-
-    WLRDP_LOG_INFO("listening on port %d", srv.port);
-
     srv.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (srv.epoll_fd < 0) {
         WLRDP_LOG_ERROR("epoll_create1 failed: %s", strerror(errno));
         goto cleanup;
     }
 
-    HANDLE events[32];
-    DWORD count = srv.listener->GetEventHandles(srv.listener, events, 32);
-    for (DWORD i = 0; i < count; i++) {
-        int fd = GetEventFileDescriptor(events[i]);
-        if (fd >= 0) {
-            epoll_add_fd(srv.epoll_fd, fd);
-        }
-    }
-
     int capture_fd = capture_get_fd(&srv.capture);
     epoll_add_fd(srv.epoll_fd, capture_fd);
+
+    if (standalone) {
+        /* Standalone: create our own RDP listener */
+        srv.listener = freerdp_listener_new();
+        if (!srv.listener) {
+            WLRDP_LOG_ERROR("freerdp_listener_new failed");
+            goto cleanup;
+        }
+
+        srv.listener->info = &srv;
+        srv.listener->PeerAccepted = on_peer_accepted;
+
+        if (!srv.listener->Open(srv.listener, "0.0.0.0", srv.port)) {
+            WLRDP_LOG_ERROR("failed to listen on port %d", srv.port);
+            goto cleanup;
+        }
+
+        WLRDP_LOG_INFO("listening on port %d", srv.port);
+
+        HANDLE events[32];
+        DWORD count = srv.listener->GetEventHandles(srv.listener, events, 32);
+        for (DWORD i = 0; i < count; i++) {
+            int fd = GetEventFileDescriptor(events[i]);
+            if (fd >= 0) epoll_add_fd(srv.epoll_fd, fd);
+        }
+    } else {
+        /* IPC mode: listen on the IPC fd for new clients */
+        epoll_add_fd(srv.epoll_fd, srv.ipc_fd);
+
+        /* Notify daemon we're ready */
+        struct wlrdp_ipc_msg msg = {
+            .type = WLRDP_MSG_STATUS,
+            .payload_len = 4,
+        };
+        uint32_t status = WLRDP_STATUS_READY;
+        memcpy(msg.payload, &status, 4);
+        ipc_send_msg(srv.ipc_fd, &msg, -1);
+    }
 
     WLRDP_LOG_INFO("entering main event loop");
 
@@ -329,9 +429,16 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            if (!srv.listener->CheckFileDescriptor(srv.listener)) {
-                WLRDP_LOG_ERROR("listener check failed");
-                g_running = 0;
+            if (!standalone && fd == srv.ipc_fd) {
+                accept_ipc_client(&srv);
+                continue;
+            }
+
+            if (standalone && srv.listener) {
+                if (!srv.listener->CheckFileDescriptor(srv.listener)) {
+                    WLRDP_LOG_ERROR("listener check failed");
+                    g_running = 0;
+                }
             }
         }
 
@@ -340,11 +447,7 @@ int main(int argc, char *argv[])
                 (struct wlrdp_peer_context *)srv.client->context;
 
             if (!srv.client->CheckFileDescriptor(srv.client)) {
-                WLRDP_LOG_INFO("client disconnected");
-                freerdp_peer_context_free(srv.client);
-                freerdp_peer_free(srv.client);
-                srv.client = NULL;
-                srv.client_active = false;
+                disconnect_client(&srv);
                 continue;
             }
 
@@ -366,6 +469,16 @@ cleanup:
     if (srv.listener) {
         srv.listener->Close(srv.listener);
         freerdp_listener_free(srv.listener);
+    }
+    if (srv.ipc_fd >= 0) {
+        struct wlrdp_ipc_msg msg = {
+            .type = WLRDP_MSG_STATUS,
+            .payload_len = 4,
+        };
+        uint32_t status = WLRDP_STATUS_TERMINATED;
+        memcpy(msg.payload, &status, 4);
+        ipc_send_msg(srv.ipc_fd, &msg, -1);
+        close(srv.ipc_fd);
     }
     if (srv.epoll_fd >= 0) {
         close(srv.epoll_fd);

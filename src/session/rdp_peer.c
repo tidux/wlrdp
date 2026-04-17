@@ -214,3 +214,14 @@ bool rdp_peer_send_frame(freerdp_peer *client,
 
     return ret;
 }
+
+bool rdp_peer_init_from_fd(freerdp_peer *client, int peer_fd,
+                           const char *cert_file, const char *key_file,
+                           struct wlrdp_input *input)
+{
+    /* Set the peer's socket fd */
+    client->sockfd = peer_fd;
+
+    /* Then do the same init as rdp_peer_init */
+    return rdp_peer_init(client, cert_file, key_file, input);
+}

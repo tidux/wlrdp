@@ -16,7 +16,7 @@ executable('wlrdp-session',
         wayland_client_dep,
         xkbcommon_dep,
         protocols_dep,
+        common_dep,
     ],
-    include_directories: [common_inc],
     install: true,
 )

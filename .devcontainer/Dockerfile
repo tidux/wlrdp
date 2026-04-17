@@ -13,6 +13,7 @@ RUN dnf install -y \
     libxkbcommon-devel \
     openssl-devel \
     openssl \
+    pam-devel \
     cage \
     xorg-x11-server-Xwayland \
     pixman-devel \
@@ -23,9 +24,14 @@ RUN dnf install -y \
     gdb \
     && dnf clean all
 
+# Create test users for multi-session testing
 RUN useradd -m developer && \
-    mkdir -p /run/user/1000 && \
-    chown developer:developer /run/user/1000
+    echo "developer:developer" | chpasswd && \
+    useradd -m testuser && \
+    echo "testuser:testuser" | chpasswd && \
+    mkdir -p /run/user/1000 /run/user/1001 && \
+    chown developer:developer /run/user/1000 && \
+    chown testuser:testuser /run/user/1001
 
 USER developer
 ENV XDG_RUNTIME_DIR=/run/user/1000

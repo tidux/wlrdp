@@ -15,6 +15,7 @@ winpr_dep = dependency('winpr3', version: '>= 3.0')
 wayland_client_dep = dependency('wayland-client')
 wayland_scanner_dep = dependency('wayland-scanner', native: true)
 xkbcommon_dep = dependency('xkbcommon')
+pam_dep = dependency('pam')
 
 wayland_scanner = find_program(
     wayland_scanner_dep.get_variable('wayland_scanner'),
@@ -23,3 +24,4 @@ wayland_scanner = find_program(
 subdir('src/protocols')
 subdir('src/common')
 subdir('src/session')
+subdir('src/daemon')
