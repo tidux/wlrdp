@@ -1,0 +1,15 @@
+# wlrdp configuration file
+# Copy to /etc/wlrdp/wlrdp.conf and adjust as needed.
+
+[server]
+port = 3389
+# cert_file = /etc/wlrdp/tls/cert.pem
+# key_file = /etc/wlrdp/tls/key.pem
+
+[session]
+desktop_cmd = foot
+default_width = 800
+default_height = 600
+
+[security]
+max_sessions = 50

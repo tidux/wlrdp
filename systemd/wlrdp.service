@@ -1,0 +1,19 @@
+[Unit]
+Description=wlrdp RDP Terminal Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wlrdp-daemon --port 3389 --desktop-cmd foot
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=false
+# NoNewPrivileges must be false because we need setuid/setgid for session workers
+
+[Install]
+WantedBy=multi-user.target
