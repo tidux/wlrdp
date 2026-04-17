@@ -24,6 +24,7 @@ struct wlrdp_peer_context {
 
     /* RDPGFX state */
     void *gfx_context;       /* RdpgfxServerContext* */
+    void *gfx_vcm;           /* HANDLE from WTSOpenServerA */
     uint16_t gfx_surface_id;
     bool gfx_opened;
     uint32_t gfx_frame_id;

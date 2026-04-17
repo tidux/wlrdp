@@ -10,6 +10,7 @@
 #include <freerdp/crypto/privatekey.h>
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/server/rdpgfx.h>
+#include <winpr/wtsapi.h>
 #include <linux/input-event-codes.h>
 
 /* --- GFX channel callbacks --- */
@@ -55,10 +56,16 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
 
 static bool gfx_init(struct wlrdp_peer_context *ctx)
 {
-    RdpgfxServerContext *gfx = rdpgfx_server_context_new(
-        (HANDLE)ctx->base.peer);
+    HANDLE vcm = WTSOpenServerA((LPSTR)&ctx->base);
+    if (!vcm || vcm == INVALID_HANDLE_VALUE) {
+        WLRDP_LOG_WARN("failed to open WTS virtual channel manager");
+        return false;
+    }
+
+    RdpgfxServerContext *gfx = rdpgfx_server_context_new(vcm);
     if (!gfx) {
         WLRDP_LOG_WARN("failed to create RDPGFX server context");
+        WTSCloseServer(vcm);
         return false;
     }
 
@@ -66,14 +73,17 @@ static bool gfx_init(struct wlrdp_peer_context *ctx)
     gfx->CapsAdvertise = gfx_caps_advertise;
 
     ctx->gfx_context = gfx;
+    ctx->gfx_vcm = vcm;
     ctx->gfx_surface_id = 0;
     ctx->gfx_frame_id = 0;
     ctx->gfx_opened = false;
 
-    if (gfx->Open(gfx) != CHANNEL_RC_OK) {
+    if (!gfx->Open(gfx)) {
         WLRDP_LOG_WARN("RDPGFX channel Open failed");
         rdpgfx_server_context_free(gfx);
         ctx->gfx_context = NULL;
+        WTSCloseServer(vcm);
+        ctx->gfx_vcm = NULL;
         return false;
     }
 
@@ -144,6 +154,10 @@ static void gfx_cleanup(struct wlrdp_peer_context *ctx)
         }
         rdpgfx_server_context_free(gfx);
         ctx->gfx_context = NULL;
+    }
+    if (ctx->gfx_vcm) {
+        WTSCloseServer(ctx->gfx_vcm);
+        ctx->gfx_vcm = NULL;
     }
 }
 
@@ -348,26 +362,29 @@ bool rdp_peer_supports_gfx_h264(freerdp_peer *client)
 
 static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
                              uint8_t *data, uint32_t len,
-                             uint32_t width, uint32_t height,
-                             bool is_keyframe)
+                             uint32_t width, uint32_t height)
 {
     RdpgfxServerContext *gfx = ctx->gfx_context;
 
+    RECTANGLE_16 region_rect = {
+        .left = 0, .top = 0,
+        .right = (UINT16)width, .bottom = (UINT16)height,
+    };
+
+    RDPGFX_H264_QUANT_QUALITY quant_qual = {
+        .qp = 22,
+        .qualityVal = 100,
+        .qpVal = 22,
+    };
+
     RDPGFX_AVC420_BITMAP_STREAM avc420 = {
-        .data = data,
-        .length = len,
-        .metaData = {
-            .regionRects = &(RECTANGLE_16){
-                .left = 0, .top = 0,
-                .right = (UINT16)width, .bottom = (UINT16)height,
-            },
+        .meta = {
             .numRegionRects = 1,
-            .quantQualityVals = &(RDPGFX_H264_QUANT_QUALITY){
-                .qp = 22,
-                .qualityVal = 100,
-                .qpVal = 22,
-            },
+            .regionRects = &region_rect,
+            .quantQualityVals = &quant_qual,
         },
+        .length = len,
+        .data = data,
     };
 
     ctx->gfx_frame_id++;
@@ -439,8 +456,10 @@ bool rdp_peer_send_frame(freerdp_peer *client,
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
 
+    (void)is_keyframe; /* AVC420 metadata carries QP, not per-frame keyframe flag */
+
     if (ctx->send_mode == WLRDP_SEND_GFX_AVC420 && ctx->gfx_context) {
-        return send_gfx_avc420(ctx, data, len, width, height, is_keyframe);
+        return send_gfx_avc420(ctx, data, len, width, height);
     }
 
     return send_surface_bits(client, data, len, width, height);
