@@ -22,6 +22,9 @@ RUN dnf install -y \
     xkeyboard-config \
     git \
     gdb \
+    ffmpeg-free-devel \
+    libva-devel \
+    mesa-va-drivers \
     && dnf clean all
 
 # Create test users for multi-session testing
