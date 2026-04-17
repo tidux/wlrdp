@@ -17,7 +17,9 @@
 #include <unistd.h>
 #include <time.h>
 
-#define FRAME_MIN_INTERVAL_MS 33 /* ~30 fps max */
+#define FRAME_INTERVAL_MIN_MS  16  /* ~60 fps ceiling */
+#define FRAME_INTERVAL_MAX_MS  100 /* 10 fps floor */
+#define FRAME_INTERVAL_DEFAULT_MS 33 /* ~30 fps starting point */
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_child_exited = 0;
@@ -29,18 +31,20 @@ struct wlrdp_server {
     const char *desktop_cmd;
     const char *cert_file;
     const char *key_file;
-    int ipc_fd;          /* -1 for standalone mode */
+    int ipc_fd;
 
     struct wlrdp_compositor comp;
     struct wlrdp_capture capture;
     struct wlrdp_input input;
     struct wlrdp_encoder encoder;
-    freerdp_listener *listener; /* NULL in IPC mode */
+    freerdp_listener *listener;
     freerdp_peer *client;
 
     int epoll_fd;
     bool client_active;
+    bool encoder_initialized;
     uint64_t last_frame_ms;
+    uint32_t frame_interval_ms;
 };
 
 static void on_signal(int sig)
@@ -59,36 +63,88 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static void init_encoder_for_client(struct wlrdp_server *srv)
+{
+    if (srv->encoder_initialized) {
+        encoder_destroy(&srv->encoder);
+        srv->encoder_initialized = false;
+    }
+
+    enum wlrdp_encoder_mode mode = WLRDP_ENCODER_NSC;
+
+    if (srv->client && rdp_peer_supports_gfx_h264(srv->client)) {
+        mode = WLRDP_ENCODER_H264;
+    }
+
+    if (!encoder_init(&srv->encoder, mode, srv->width, srv->height)) {
+        WLRDP_LOG_ERROR("failed to initialize encoder");
+        return;
+    }
+
+    srv->encoder_initialized = true;
+
+    WLRDP_LOG_INFO("encoder mode: %s",
+                    srv->encoder.mode == WLRDP_ENCODER_H264
+                        ? "H.264" : "NSCodec");
+}
+
 static void on_frame_ready(void *data, uint8_t *pixels,
                            uint32_t width, uint32_t height,
                            uint32_t stride)
 {
     struct wlrdp_server *srv = data;
 
-    if (!srv->client_active || !srv->client) return;
+    if (!srv->client_active || !srv->client || !srv->encoder_initialized)
+        return;
 
     uint64_t now = now_ms();
-    if (now - srv->last_frame_ms < FRAME_MIN_INTERVAL_MS) {
+    if (now - srv->last_frame_ms < srv->frame_interval_ms) {
         capture_request_frame(&srv->capture);
         return;
     }
-    srv->last_frame_ms = now;
 
-    /* Flip image vertically — screencopy gives top-down, but
-     * SurfaceBits with codecID=0 expects bottom-up row order. */
-    uint32_t row_bytes = width * 4;
-    for (uint32_t top = 0, bot = height - 1; top < bot; top++, bot--) {
-        uint8_t *a = pixels + top * stride;
-        uint8_t *b = pixels + bot * stride;
-        for (uint32_t i = 0; i < row_bytes; i++) {
-            uint8_t tmp = a[i];
-            a[i] = b[i];
-            b[i] = tmp;
+    uint64_t encode_start = now;
+
+    /* For SurfaceBits mode, flip the image (screencopy is top-down,
+     * SurfaceBits with codecID=0 expects bottom-up). */
+    if (srv->encoder.mode == WLRDP_ENCODER_NSC) {
+        uint32_t row_bytes = width * 4;
+        for (uint32_t top = 0, bot = height - 1; top < bot; top++, bot--) {
+            uint8_t *a = pixels + top * stride;
+            uint8_t *b = pixels + bot * stride;
+            for (uint32_t i = 0; i < row_bytes; i++) {
+                uint8_t tmp = a[i];
+                a[i] = b[i];
+                b[i] = tmp;
+            }
         }
     }
 
-    rdp_peer_send_frame(srv->client, pixels, width * height * 4,
-                        width, height);
+    if (!encoder_encode(&srv->encoder, pixels, stride)) {
+        capture_request_frame(&srv->capture);
+        return;
+    }
+
+    if (srv->encoder.out_len == 0) {
+        /* Encoder buffering (shouldn't happen with zerolatency) */
+        capture_request_frame(&srv->capture);
+        return;
+    }
+
+    rdp_peer_send_frame(srv->client, srv->encoder.out_buf,
+                        srv->encoder.out_len, width, height,
+                        srv->encoder.is_keyframe);
+
+    /* Adaptive framerate: target interval = 2x encode+send time,
+     * clamped to [16ms, 100ms] */
+    uint64_t encode_time = now_ms() - encode_start;
+    uint32_t target = (uint32_t)(encode_time * 2);
+    if (target < FRAME_INTERVAL_MIN_MS) target = FRAME_INTERVAL_MIN_MS;
+    if (target > FRAME_INTERVAL_MAX_MS) target = FRAME_INTERVAL_MAX_MS;
+
+    /* Smooth the interval to avoid jitter */
+    srv->frame_interval_ms = (srv->frame_interval_ms * 3 + target) / 4;
+    srv->last_frame_ms = now_ms();
 
     capture_request_frame(&srv->capture);
 }
@@ -103,7 +159,11 @@ static void disconnect_client(struct wlrdp_server *srv)
         WLRDP_LOG_INFO("client disconnected");
     }
 
-    /* In IPC mode, notify daemon and wait for reconnect. */
+    if (srv->encoder_initialized) {
+        encoder_destroy(&srv->encoder);
+        srv->encoder_initialized = false;
+    }
+
     if (srv->ipc_fd >= 0) {
         struct wlrdp_ipc_msg msg = {
             .type = WLRDP_MSG_STATUS,
@@ -138,7 +198,6 @@ static bool accept_ipc_client(struct wlrdp_server *srv)
         return false;
     }
 
-    /* Disconnect any existing client first */
     disconnect_client(srv);
 
     WLRDP_LOG_INFO("received new client fd %d from daemon", peer_fd);
@@ -263,6 +322,7 @@ int main(int argc, char *argv[])
         .cert_file = NULL,
         .key_file = NULL,
         .ipc_fd = -1,
+        .frame_interval_ms = FRAME_INTERVAL_DEFAULT_MS,
     };
 
     static struct option long_opts[] = {
@@ -301,7 +361,6 @@ int main(int argc, char *argv[])
         WLRDP_LOG_INFO("running in IPC mode (fd=%d)", srv.ipc_fd);
     }
 
-    /* Auto-generate cert only in standalone mode */
     static char auto_cert[] = "/tmp/wlrdp-cert.pem";
     static char auto_key[] = "/tmp/wlrdp-key.pem";
     if (standalone && (!srv.cert_file || !srv.key_file)) {
@@ -339,13 +398,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (!encoder_init(&srv.encoder, srv.width, srv.height)) {
-        WLRDP_LOG_ERROR("failed to initialize encoder");
-        input_destroy(&srv.input);
-        capture_destroy(&srv.capture);
-        compositor_destroy(&srv.comp);
-        return 1;
-    }
+    /* Encoder is initialized per-client after capability negotiation */
 
     srv.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (srv.epoll_fd < 0) {
@@ -357,7 +410,6 @@ int main(int argc, char *argv[])
     epoll_add_fd(srv.epoll_fd, capture_fd);
 
     if (standalone) {
-        /* Standalone: create our own RDP listener */
         srv.listener = freerdp_listener_new();
         if (!srv.listener) {
             WLRDP_LOG_ERROR("freerdp_listener_new failed");
@@ -381,10 +433,8 @@ int main(int argc, char *argv[])
             if (fd >= 0) epoll_add_fd(srv.epoll_fd, fd);
         }
     } else {
-        /* IPC mode: listen on the IPC fd for new clients */
         epoll_add_fd(srv.epoll_fd, srv.ipc_fd);
 
-        /* Notify daemon we're ready */
         struct wlrdp_ipc_msg msg = {
             .type = WLRDP_MSG_STATUS,
             .payload_len = 4,
@@ -453,6 +503,11 @@ int main(int argc, char *argv[])
 
             if (ctx->activated && !srv.client_active) {
                 srv.client_active = true;
+                srv.frame_interval_ms = FRAME_INTERVAL_DEFAULT_MS;
+
+                /* Now that capabilities are negotiated, init encoder */
+                init_encoder_for_client(&srv);
+
                 WLRDP_LOG_INFO("starting frame capture");
                 capture_request_frame(&srv.capture);
             }
@@ -483,7 +538,9 @@ cleanup:
     if (srv.epoll_fd >= 0) {
         close(srv.epoll_fd);
     }
-    encoder_destroy(&srv.encoder);
+    if (srv.encoder_initialized) {
+        encoder_destroy(&srv.encoder);
+    }
     input_destroy(&srv.input);
     capture_destroy(&srv.capture);
     compositor_destroy(&srv.comp);
