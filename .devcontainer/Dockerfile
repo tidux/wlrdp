@@ -14,12 +14,19 @@ RUN dnf install -y \
     openssl-devel \
     openssl \
     cage \
+    xorg-x11-server-Xwayland \
+    pixman-devel \
+    wlr-randr \
     foot \
     xkeyboard-config \
     git \
     gdb \
     && dnf clean all
 
-RUN useradd -m developer
+RUN useradd -m developer && \
+    mkdir -p /run/user/1000 && \
+    chown developer:developer /run/user/1000
+
 USER developer
+ENV XDG_RUNTIME_DIR=/run/user/1000
 WORKDIR /workspace

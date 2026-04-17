@@ -7,7 +7,7 @@ project('wlrdp', 'c',
     ],
 )
 
-add_project_arguments('-D_GNU_SOURCE', language: 'c')
+add_project_arguments('-D_GNU_SOURCE', '-Wno-deprecated-declarations', language: 'c')
 
 freerdp_dep = dependency('freerdp3', version: '>= 3.0')
 freerdp_server_dep = dependency('freerdp-server3', version: '>= 3.0')

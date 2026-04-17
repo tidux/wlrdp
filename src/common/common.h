@@ -16,7 +16,7 @@
     fprintf(stderr, "[wlrdp] ERROR: " fmt "\n", ##__VA_ARGS__)
 
 #define WLRDP_DEFAULT_PORT 3389
-#define WLRDP_DEFAULT_WIDTH 1920
-#define WLRDP_DEFAULT_HEIGHT 1080
+#define WLRDP_DEFAULT_WIDTH 800
+#define WLRDP_DEFAULT_HEIGHT 600
 
 #endif /* WLRDP_COMMON_H */

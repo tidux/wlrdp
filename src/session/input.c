@@ -89,8 +89,16 @@ static bool setup_keymap(struct wlrdp_input *inp)
                                     fd, keymap_size);
     close(fd);
     free(keymap_str);
+
+    /* Create XKB state for modifier tracking */
+    inp->xkb_state = xkb_state_new(keymap);
     xkb_keymap_unref(keymap);
     xkb_context_unref(ctx);
+
+    if (!inp->xkb_state) {
+        WLRDP_LOG_ERROR("failed to create xkb state");
+        return false;
+    }
 
     WLRDP_LOG_INFO("loaded XKB keymap (us/pc105)");
     return true;
@@ -182,7 +190,6 @@ void input_pointer_motion(struct wlrdp_input *inp, uint32_t x, uint32_t y)
                                              x, y,
                                              inp->width, inp->height);
     zwlr_virtual_pointer_v1_frame(inp->vptr);
-    wl_display_flush(inp->display);
 }
 
 void input_pointer_button(struct wlrdp_input *inp, uint32_t button,
@@ -192,7 +199,6 @@ void input_pointer_button(struct wlrdp_input *inp, uint32_t button,
         pressed ? WL_POINTER_BUTTON_STATE_PRESSED
                 : WL_POINTER_BUTTON_STATE_RELEASED);
     zwlr_virtual_pointer_v1_frame(inp->vptr);
-    wl_display_flush(inp->display);
 }
 
 void input_pointer_axis(struct wlrdp_input *inp, int32_t value)
@@ -201,14 +207,37 @@ void input_pointer_axis(struct wlrdp_input *inp, int32_t value)
                                   WL_POINTER_AXIS_VERTICAL_SCROLL,
                                   value * 256);
     zwlr_virtual_pointer_v1_frame(inp->vptr);
-    wl_display_flush(inp->display);
 }
 
 void input_keyboard_key(struct wlrdp_input *inp, uint32_t key, bool pressed)
 {
-    zwp_virtual_keyboard_v1_key(inp->vkbd, get_time_ms(), key,
+    uint32_t ts = get_time_ms();
+
+    zwp_virtual_keyboard_v1_key(inp->vkbd, ts, key,
         pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
                 : WL_KEYBOARD_KEY_STATE_RELEASED);
+
+    /* Update XKB state and send modifier changes.
+     * XKB keycodes = evdev + 8. */
+    xkb_state_update_key(inp->xkb_state, key + 8,
+        pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+
+    uint32_t depressed = xkb_state_serialize_mods(inp->xkb_state,
+        XKB_STATE_MODS_DEPRESSED);
+    uint32_t latched = xkb_state_serialize_mods(inp->xkb_state,
+        XKB_STATE_MODS_LATCHED);
+    uint32_t locked = xkb_state_serialize_mods(inp->xkb_state,
+        XKB_STATE_MODS_LOCKED);
+    uint32_t group = xkb_state_serialize_layout(inp->xkb_state,
+        XKB_STATE_LAYOUT_EFFECTIVE);
+
+    zwp_virtual_keyboard_v1_modifiers(inp->vkbd,
+        depressed, latched, locked, group);
+
+}
+
+void input_flush(struct wlrdp_input *inp)
+{
     wl_display_flush(inp->display);
 }
 
@@ -224,6 +253,7 @@ int input_dispatch(struct wlrdp_input *inp)
 
 void input_destroy(struct wlrdp_input *inp)
 {
+    if (inp->xkb_state) xkb_state_unref(inp->xkb_state);
     if (inp->vkbd) zwp_virtual_keyboard_v1_destroy(inp->vkbd);
     if (inp->vptr) zwlr_virtual_pointer_v1_destroy(inp->vptr);
     if (inp->vkbd_mgr) zwp_virtual_keyboard_manager_v1_destroy(inp->vkbd_mgr);

@@ -6,6 +6,8 @@
 #include <freerdp/peer.h>
 #include <freerdp/settings.h>
 #include <freerdp/codec/nsc.h>
+#include <freerdp/crypto/certificate.h>
+#include <freerdp/crypto/privatekey.h>
 #include <linux/input-event-codes.h>
 
 static BOOL on_post_connect(freerdp_peer *client)
@@ -17,8 +19,18 @@ static BOOL on_post_connect(freerdp_peer *client)
                     freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight),
                     freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth));
 
+    WLRDP_LOG_INFO("negotiated: NSCodec=%d NSCodecId=%u "
+                    "RemoteFxCodec=%d SurfaceCommands=%d "
+                    "FrameMarker=%d BitmapCacheV3=%d",
+        freerdp_settings_get_bool(settings, FreeRDP_NSCodec),
+        freerdp_settings_get_uint32(settings, FreeRDP_NSCodecId),
+        freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec),
+        freerdp_settings_get_bool(settings, FreeRDP_SurfaceCommandsEnabled),
+        freerdp_settings_get_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled),
+        freerdp_settings_get_bool(settings, FreeRDP_BitmapCacheV3Enabled));
+
     if (!freerdp_settings_get_bool(settings, FreeRDP_NSCodec)) {
-        WLRDP_LOG_WARN("client does not support NSCodec, falling back to raw bitmap");
+        WLRDP_LOG_WARN("client does not support NSCodec, using raw bitmaps");
     }
 
     return TRUE;
@@ -41,6 +53,10 @@ static BOOL on_keyboard_event(rdpInput *input, UINT16 flags, UINT8 code)
 
     if (!ctx->input) return TRUE;
 
+    /* RDP scancodes are XT set 1. The virtual keyboard protocol expects
+     * evdev keycodes, which equal the XT scancode for non-extended keys.
+     * Extended keys need a lookup table. No +8 offset — the virtual
+     * keyboard protocol handles the XKB offset internally. */
     uint32_t evdev_key;
     if (flags & KBD_FLAGS_EXTENDED) {
         switch (code) {
@@ -61,10 +77,10 @@ static BOOL on_keyboard_event(rdpInput *input, UINT16 flags, UINT8 code)
         case 0x5B: evdev_key = KEY_LEFTMETA; break;
         case 0x5C: evdev_key = KEY_RIGHTMETA; break;
         case 0x5D: evdev_key = KEY_COMPOSE; break;
-        default:   evdev_key = code + 8; break;
+        default:   evdev_key = code; break;
         }
     } else {
-        evdev_key = code + 8;
+        evdev_key = code;
     }
 
     bool pressed = !(flags & KBD_FLAGS_RELEASE);
@@ -116,6 +132,7 @@ static BOOL on_extended_mouse_event(rdpInput *input, UINT16 flags,
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
 
+    (void)flags;
     if (!ctx->input) return TRUE;
 
     input_pointer_motion(ctx->input, x, y);
@@ -127,12 +144,23 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
 {
     rdpSettings *settings = client->context->settings;
 
-    if (!freerdp_settings_set_string(settings, FreeRDP_CertificateFile, cert_file)) {
-        WLRDP_LOG_ERROR("failed to set certificate file");
+    rdpCertificate *cert = freerdp_certificate_new_from_file(cert_file);
+    if (!cert) {
+        WLRDP_LOG_ERROR("failed to load certificate from '%s'", cert_file);
         return false;
     }
-    if (!freerdp_settings_set_string(settings, FreeRDP_PrivateKeyFile, key_file)) {
-        WLRDP_LOG_ERROR("failed to set private key file");
+    if (!freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerCertificate, cert, 1)) {
+        WLRDP_LOG_ERROR("failed to set server certificate");
+        return false;
+    }
+
+    rdpPrivateKey *key = freerdp_key_new_from_file(key_file);
+    if (!key) {
+        WLRDP_LOG_ERROR("failed to load private key from '%s'", key_file);
+        return false;
+    }
+    if (!freerdp_settings_set_pointer_len(settings, FreeRDP_RdpServerRsaKey, key, 1)) {
+        WLRDP_LOG_ERROR("failed to set server private key");
         return false;
     }
 
@@ -140,7 +168,7 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
     freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE);
 
-    freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_SurfaceCommandsEnabled, TRUE);
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
     client->PostConnect = on_post_connect;
@@ -164,6 +192,7 @@ bool rdp_peer_send_frame(freerdp_peer *client,
     rdpSettings *settings = client->context->settings;
 
     SURFACE_BITS_COMMAND cmd = { 0 };
+    cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
     cmd.destLeft = 0;
     cmd.destTop = 0;
     cmd.destRight = width;
@@ -172,19 +201,15 @@ bool rdp_peer_send_frame(freerdp_peer *client,
     cmd.bmp.width = width;
     cmd.bmp.height = height;
 
-    if (freerdp_settings_get_bool(settings, FreeRDP_NSCodec)) {
-        cmd.bmp.codecID = freerdp_settings_get_uint32(settings,
-                            FreeRDP_NSCodecId);
-    } else {
-        cmd.bmp.codecID = 0;
-    }
+    (void)settings;
+    cmd.bmp.codecID = 0; /* raw bitmap — NSCodec negotiation TBD */
 
     cmd.bmp.bitmapDataLength = len;
     cmd.bmp.bitmapData = data;
 
     BOOL ret = update->SurfaceBits(update->context, &cmd);
     if (!ret) {
-        WLRDP_LOG_WARN("SurfaceBits failed");
+        WLRDP_LOG_WARN("SurfaceBits failed (codecID=%u)", cmd.bmp.codecID);
     }
 
     return ret;

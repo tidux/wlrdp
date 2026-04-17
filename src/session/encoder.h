@@ -8,6 +8,7 @@ struct wlrdp_encoder {
     uint32_t width;
     uint32_t height;
     void *nsc_ctx;
+    void *stream;
     uint8_t *out_buf;
     uint32_t out_len;
 };

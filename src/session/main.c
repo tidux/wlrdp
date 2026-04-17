@@ -14,6 +14,9 @@
 #include <sys/epoll.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
+
+#define FRAME_MIN_INTERVAL_MS 33 /* ~30 fps max */
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_child_exited = 0;
@@ -35,6 +38,7 @@ struct wlrdp_server {
 
     int epoll_fd;
     bool client_active;
+    uint64_t last_frame_ms;
 };
 
 static void on_signal(int sig)
@@ -46,6 +50,13 @@ static void on_signal(int sig)
     }
 }
 
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static void on_frame_ready(void *data, uint8_t *pixels,
                            uint32_t width, uint32_t height,
                            uint32_t stride)
@@ -54,10 +65,29 @@ static void on_frame_ready(void *data, uint8_t *pixels,
 
     if (!srv->client_active || !srv->client) return;
 
-    if (!encoder_encode(&srv->encoder, pixels, stride)) return;
+    /* Throttle: skip frame if too soon */
+    uint64_t now = now_ms();
+    if (now - srv->last_frame_ms < FRAME_MIN_INTERVAL_MS) {
+        capture_request_frame(&srv->capture);
+        return;
+    }
+    srv->last_frame_ms = now;
 
-    rdp_peer_send_frame(srv->client, srv->encoder.out_buf,
-                        srv->encoder.out_len, width, height);
+    /* Flip image vertically — screencopy gives top-down, but
+     * SurfaceBits with codecID=0 expects bottom-up row order. */
+    uint32_t row_bytes = width * 4;
+    for (uint32_t top = 0, bot = height - 1; top < bot; top++, bot--) {
+        uint8_t *a = pixels + top * stride;
+        uint8_t *b = pixels + bot * stride;
+        for (uint32_t i = 0; i < row_bytes; i++) {
+            uint8_t tmp = a[i];
+            a[i] = b[i];
+            b[i] = tmp;
+        }
+    }
+
+    rdp_peer_send_frame(srv->client, pixels, width * height * 4,
+                        width, height);
 
     capture_request_frame(&srv->capture);
 }
@@ -278,6 +308,7 @@ int main(int argc, char *argv[])
         }
 
         wl_display_flush(srv.capture.display);
+        input_flush(&srv.input);
 
         struct epoll_event events[16];
         int nfds = epoll_wait(srv.epoll_fd, events, 16, 16);
