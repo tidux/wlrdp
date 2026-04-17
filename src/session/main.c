@@ -9,6 +9,7 @@
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
 #include <freerdp/peer.h>
+#include <freerdp/settings.h>
 
 #include <getopt.h>
 #include <signal.h>
@@ -41,6 +42,7 @@ struct wlrdp_server {
     freerdp_peer *client;
 
     int epoll_fd;
+    int vcm_fd;            /* VCM event fd for DRDYNVC polling, -1 if inactive */
     bool client_active;
     bool encoder_initialized;
     uint64_t last_frame_ms;
@@ -105,8 +107,8 @@ static void on_frame_ready(void *data, uint8_t *pixels,
 
     uint64_t encode_start = now;
 
-    /* For SurfaceBits mode, flip the image (screencopy is top-down,
-     * SurfaceBits with codecID=0 expects bottom-up). */
+    /* For SurfaceBits/NSCodec mode, flip the image (screencopy is top-down,
+     * SurfaceBits expects bottom-up). */
     if (srv->encoder.mode == WLRDP_ENCODER_NSC) {
         uint32_t row_bytes = width * 4;
         for (uint32_t top = 0, bot = height - 1; top < bot; top++, bot--) {
@@ -151,6 +153,11 @@ static void on_frame_ready(void *data, uint8_t *pixels,
 
 static void disconnect_client(struct wlrdp_server *srv)
 {
+    if (srv->vcm_fd >= 0) {
+        epoll_ctl(srv->epoll_fd, EPOLL_CTL_DEL, srv->vcm_fd, NULL);
+        srv->vcm_fd = -1;
+    }
+
     if (srv->client) {
         freerdp_peer_context_free(srv->client);
         freerdp_peer_free(srv->client);
@@ -223,6 +230,18 @@ static bool accept_ipc_client(struct wlrdp_server *srv)
         return false;
     }
 
+    /* Force desktop size to match our compositor */
+    freerdp_settings_set_uint32(client->context->settings,
+                                FreeRDP_DesktopWidth, srv->width);
+    freerdp_settings_set_uint32(client->context->settings,
+                                FreeRDP_DesktopHeight, srv->height);
+    {
+        struct wlrdp_peer_context *pctx =
+            (struct wlrdp_peer_context *)client->context;
+        pctx->width = srv->width;
+        pctx->height = srv->height;
+    }
+
     if (!client->Initialize(client)) {
         WLRDP_LOG_ERROR("peer Initialize failed");
         freerdp_peer_context_free(client);
@@ -260,6 +279,18 @@ static BOOL on_peer_accepted(freerdp_listener *listener,
         return FALSE;
     }
 
+    /* Force desktop size to match our compositor */
+    freerdp_settings_set_uint32(client->context->settings,
+                                FreeRDP_DesktopWidth, srv->width);
+    freerdp_settings_set_uint32(client->context->settings,
+                                FreeRDP_DesktopHeight, srv->height);
+    {
+        struct wlrdp_peer_context *pctx =
+            (struct wlrdp_peer_context *)client->context;
+        pctx->width = srv->width;
+        pctx->height = srv->height;
+    }
+
     if (!client->Initialize(client)) {
         WLRDP_LOG_ERROR("peer Initialize failed");
         freerdp_peer_context_free(client);
@@ -279,6 +310,19 @@ static bool epoll_add_fd(int epoll_fd, int fd)
         .data.fd = fd,
     };
     return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0;
+}
+
+static void epoll_add_vcm(struct wlrdp_server *srv)
+{
+    if (!srv->client)
+        return;
+
+    int fd = rdp_peer_get_vcm_fd(srv->client);
+    if (fd >= 0 && fd != srv->vcm_fd) {
+        epoll_add_fd(srv->epoll_fd, fd);
+        srv->vcm_fd = fd;
+        WLRDP_LOG_INFO("VCM fd %d added to epoll", fd);
+    }
 }
 
 static void generate_self_signed_cert(const char *cert_file,
@@ -322,6 +366,7 @@ int main(int argc, char *argv[])
         .cert_file = NULL,
         .key_file = NULL,
         .ipc_fd = -1,
+        .vcm_fd = -1,
         .frame_interval_ms = FRAME_INTERVAL_DEFAULT_MS,
     };
 
@@ -484,6 +529,14 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            if (srv.vcm_fd >= 0 && fd == srv.vcm_fd) {
+                if (!rdp_peer_check_vcm(srv.client)) {
+                    WLRDP_LOG_WARN("VCM fatal error");
+                    disconnect_client(&srv);
+                }
+                continue;
+            }
+
             if (standalone && srv.listener) {
                 if (!srv.listener->CheckFileDescriptor(srv.listener)) {
                     WLRDP_LOG_ERROR("listener check failed");
@@ -501,14 +554,45 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            /* Pick up VCM fd once post_connect creates it */
+            if (srv.vcm_fd < 0)
+                epoll_add_vcm(&srv);
+
+            /* Always pump VCM to process GFX responses */
+            if (!rdp_peer_check_vcm(srv.client)) {
+                WLRDP_LOG_WARN("VCM fatal error");
+                disconnect_client(&srv);
+                continue;
+            }
+
             if (ctx->activated && !srv.client_active) {
+                /* If GFX/VCM is active, wait for negotiation to complete
+                 * before starting frames. Otherwise start immediately. */
+                if (!ctx->gfx_vcm || ctx->gfx_ready) {
+                    srv.client_active = true;
+                    srv.frame_interval_ms = FRAME_INTERVAL_DEFAULT_MS;
+                    init_encoder_for_client(&srv);
+                    WLRDP_LOG_INFO("starting frame capture");
+                    capture_request_frame(&srv.capture);
+                }
+            }
+
+            /* GFX negotiation completed — now start frames */
+            if (ctx->activated && !srv.client_active && ctx->gfx_ready) {
                 srv.client_active = true;
                 srv.frame_interval_ms = FRAME_INTERVAL_DEFAULT_MS;
-
-                /* Now that capabilities are negotiated, init encoder */
                 init_encoder_for_client(&srv);
+                WLRDP_LOG_INFO("GFX ready, starting frame capture with H.264");
+                capture_request_frame(&srv.capture);
+            }
 
-                WLRDP_LOG_INFO("starting frame capture");
+            /* GFX VCM failed — fall back and start with NSCodec */
+            if (ctx->activated && !srv.client_active &&
+                ctx->gfx_vcm == NULL && !ctx->gfx_ready) {
+                srv.client_active = true;
+                srv.frame_interval_ms = FRAME_INTERVAL_DEFAULT_MS;
+                init_encoder_for_client(&srv);
+                WLRDP_LOG_INFO("GFX failed, starting frame capture with NSCodec");
                 capture_request_frame(&srv.capture);
             }
         }

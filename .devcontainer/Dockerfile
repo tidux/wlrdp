@@ -1,5 +1,11 @@
 FROM registry.fedoraproject.org/fedora:43
 
+# Enable RPMFusion for full FFmpeg with patented codecs (H.264/x264)
+RUN dnf install -y \
+    https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-43.noarch.rpm \
+    https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-43.noarch.rpm \
+    && dnf clean all
+
 RUN dnf install -y \
     gcc \
     meson \
@@ -22,9 +28,10 @@ RUN dnf install -y \
     xkeyboard-config \
     git \
     gdb \
-    ffmpeg-free-devel \
+    ffmpeg-devel \
     libva-devel \
     mesa-va-drivers \
+    labwc \
     && dnf clean all
 
 # Create test users for multi-session testing

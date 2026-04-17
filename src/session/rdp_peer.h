@@ -27,6 +27,7 @@ struct wlrdp_peer_context {
     void *gfx_vcm;           /* HANDLE from WTSOpenServerA */
     uint16_t gfx_surface_id;
     bool gfx_opened;
+    bool gfx_ready;          /* true once DRDYNVC ready + GFX opened + surface created */
     uint32_t gfx_frame_id;
 
     enum wlrdp_send_mode send_mode;
@@ -48,9 +49,23 @@ bool rdp_peer_send_frame(freerdp_peer *client,
 
 /*
  * Query whether the client supports GFX+AVC420.
- * Only valid after the peer is activated.
+ * Only valid after GFX negotiation completes (gfx_ready == true).
  */
 bool rdp_peer_supports_gfx_h264(freerdp_peer *client);
+
+/*
+ * Get the file descriptor for the VCM event handle, for epoll.
+ * Returns -1 if no VCM is active.
+ */
+int rdp_peer_get_vcm_fd(freerdp_peer *client);
+
+/*
+ * Poll the VCM for DRDYNVC progress. Call this from the event loop
+ * whenever the VCM fd is readable. Returns false on fatal error.
+ * When DRDYNVC becomes ready, this opens the GFX channel and creates
+ * the surface automatically.
+ */
+bool rdp_peer_check_vcm(freerdp_peer *client);
 
 bool rdp_peer_init_from_fd(freerdp_peer *client, int peer_fd,
                            const char *cert_file, const char *key_file,

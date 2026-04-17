@@ -9,9 +9,17 @@
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #include <freerdp/channels/rdpgfx.h>
+#include <freerdp/channels/channels.h>
+#include <freerdp/channels/wtsvc.h>
+#include <freerdp/codec/color.h>
 #include <freerdp/server/rdpgfx.h>
 #include <winpr/wtsapi.h>
 #include <linux/input-event-codes.h>
+
+/* Forward declarations */
+static void gfx_cleanup(struct wlrdp_peer_context *ctx);
+static bool gfx_create_surface(struct wlrdp_peer_context *ctx,
+                                uint32_t width, uint32_t height);
 
 /* --- GFX channel callbacks --- */
 
@@ -51,21 +59,69 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
                         "falling back to SurfaceBits");
     }
 
-    return context->CapsConfirm(context, &confirm);
+    UINT rc = context->CapsConfirm(context, &confirm);
+    if (rc != CHANNEL_RC_OK)
+        return rc;
+
+    /* Caps negotiation complete — now create the GFX surface.
+     * Use compositor dimensions (ctx->width/height), not the client's
+     * negotiated DesktopWidth/Height which may differ. */
+    if (ctx->activated && !ctx->gfx_surface_id) {
+        uint32_t w = ctx->width;
+        uint32_t h = ctx->height;
+        if (gfx_create_surface(ctx, w, h)) {
+            ctx->gfx_ready = true;
+            WLRDP_LOG_INFO("GFX pipeline ready after caps negotiation");
+        } else {
+            ctx->send_mode = WLRDP_SEND_SURFACE_BITS;
+            gfx_cleanup(ctx);
+        }
+    }
+
+    return CHANNEL_RC_OK;
 }
 
-static bool gfx_init(struct wlrdp_peer_context *ctx)
+/*
+ * Phase 1: Create the VCM and open the DRDYNVC transport.
+ * Called from on_post_connect. The GFX channel is NOT opened yet —
+ * that happens in rdp_peer_check_vcm once DRDYNVC is ready.
+ */
+static bool vcm_init(struct wlrdp_peer_context *ctx)
 {
+    /* Register FreeRDP's WTS API so WTSOpenServerA can create a VCM
+     * from a peer context (without this, it tries FreeRDS IPC). */
+    WTSRegisterWtsApiFunctionTable(FreeRDP_InitWtsApi());
+
     HANDLE vcm = WTSOpenServerA((LPSTR)&ctx->base);
     if (!vcm || vcm == INVALID_HANDLE_VALUE) {
         WLRDP_LOG_WARN("failed to open WTS virtual channel manager");
         return false;
     }
 
+    ctx->gfx_vcm = vcm;
+
+    /* Initialize DRDYNVC transport — this starts the async handshake */
+    if (!WTSVirtualChannelManagerOpen(vcm)) {
+        WLRDP_LOG_WARN("WTSVirtualChannelManagerOpen failed");
+        WTSCloseServer(vcm);
+        ctx->gfx_vcm = NULL;
+        return false;
+    }
+
+    WLRDP_LOG_INFO("VCM opened, waiting for DRDYNVC handshake");
+    return true;
+}
+
+/*
+ * Phase 2: Open the GFX channel once DRDYNVC is ready.
+ */
+static bool gfx_open(struct wlrdp_peer_context *ctx)
+{
+    HANDLE vcm = ctx->gfx_vcm;
+
     RdpgfxServerContext *gfx = rdpgfx_server_context_new(vcm);
     if (!gfx) {
         WLRDP_LOG_WARN("failed to create RDPGFX server context");
-        WTSCloseServer(vcm);
         return false;
     }
 
@@ -73,7 +129,6 @@ static bool gfx_init(struct wlrdp_peer_context *ctx)
     gfx->CapsAdvertise = gfx_caps_advertise;
 
     ctx->gfx_context = gfx;
-    ctx->gfx_vcm = vcm;
     ctx->gfx_surface_id = 0;
     ctx->gfx_frame_id = 0;
     ctx->gfx_opened = false;
@@ -82,8 +137,6 @@ static bool gfx_init(struct wlrdp_peer_context *ctx)
         WLRDP_LOG_WARN("RDPGFX channel Open failed");
         rdpgfx_server_context_free(gfx);
         ctx->gfx_context = NULL;
-        WTSCloseServer(vcm);
-        ctx->gfx_vcm = NULL;
         return false;
     }
 
@@ -108,9 +161,9 @@ static bool gfx_create_surface(struct wlrdp_peer_context *ctx,
         },
     };
 
-    if (gfx->ResetGraphics(gfx, &reset) != CHANNEL_RC_OK) {
-        WLRDP_LOG_ERROR("GFX ResetGraphics failed");
-        return false;
+    UINT rc = gfx->ResetGraphics(gfx, &reset);
+    if (rc != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX ResetGraphics failed (rc=%u), continuing anyway", rc);
     }
 
     RDPGFX_CREATE_SURFACE_PDU create = {
@@ -159,6 +212,9 @@ static void gfx_cleanup(struct wlrdp_peer_context *ctx)
         WTSCloseServer(ctx->gfx_vcm);
         ctx->gfx_vcm = NULL;
     }
+    ctx->gfx_opened = false;
+    ctx->gfx_ready = false;
+    ctx->gfx_surface_id = 0;
 }
 
 /* --- RDP input callbacks --- */
@@ -258,9 +314,12 @@ static BOOL on_post_connect(freerdp_peer *client)
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
 
+    /* Override client-requested size with our compositor dimensions */
+    freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, ctx->width);
+    freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, ctx->height);
+
     WLRDP_LOG_INFO("RDP client connected: %ux%u %ubpp",
-                    freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
-                    freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight),
+                    ctx->width, ctx->height,
                     freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth));
 
     WLRDP_LOG_INFO("negotiated: NSCodec=%d SurfaceCommands=%d GfxH264=%d",
@@ -268,9 +327,9 @@ static BOOL on_post_connect(freerdp_peer *client)
         freerdp_settings_get_bool(settings, FreeRDP_SurfaceCommandsEnabled),
         freerdp_settings_get_bool(settings, FreeRDP_GfxH264));
 
-    /* Try to open GFX channel */
+    /* Start VCM + DRDYNVC handshake — GFX opens later via rdp_peer_check_vcm */
     if (freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline)) {
-        gfx_init(ctx);
+        vcm_init(ctx);
     }
 
     return TRUE;
@@ -282,17 +341,6 @@ static BOOL on_activate(freerdp_peer *client)
         (struct wlrdp_peer_context *)client->context;
 
     ctx->activated = true;
-
-    /* If GFX is open but surface not yet created, create it now */
-    if (ctx->gfx_context && !ctx->gfx_surface_id) {
-        rdpSettings *settings = client->context->settings;
-        uint32_t w = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
-        uint32_t h = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
-        if (!gfx_create_surface(ctx, w, h)) {
-            ctx->send_mode = WLRDP_SEND_SURFACE_BITS;
-            gfx_cleanup(ctx);
-        }
-    }
 
     WLRDP_LOG_INFO("RDP peer activated (send_mode=%s)",
                     ctx->send_mode == WLRDP_SEND_GFX_AVC420
@@ -334,6 +382,10 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     freerdp_settings_set_bool(settings, FreeRDP_SurfaceCommandsEnabled, TRUE);
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
+    /* Enable NSCodec for SurfaceBits fallback path */
+    freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_NSCodecAllowSubsampling, TRUE);
+
     /* Advertise GFX pipeline support */
     freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
@@ -357,7 +409,65 @@ bool rdp_peer_supports_gfx_h264(freerdp_peer *client)
 {
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
-    return ctx->send_mode == WLRDP_SEND_GFX_AVC420;
+    return ctx->gfx_ready && ctx->send_mode == WLRDP_SEND_GFX_AVC420;
+}
+
+int rdp_peer_get_vcm_fd(freerdp_peer *client)
+{
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+
+    if (!ctx->gfx_vcm)
+        return -1;
+
+    HANDLE event = WTSVirtualChannelManagerGetEventHandle(ctx->gfx_vcm);
+    if (!event || event == INVALID_HANDLE_VALUE)
+        return -1;
+
+    return GetEventFileDescriptor(event);
+}
+
+bool rdp_peer_check_vcm(freerdp_peer *client)
+{
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+
+    if (!ctx->gfx_vcm)
+        return true;
+
+    /* Already opened (or fully set up) — just pump the VCM */
+    if (ctx->gfx_opened || ctx->gfx_ready)
+        return WTSVirtualChannelManagerCheckFileDescriptor(ctx->gfx_vcm);
+
+    if (!WTSVirtualChannelManagerCheckFileDescriptor(ctx->gfx_vcm)) {
+        WLRDP_LOG_WARN("VCM check failed");
+        gfx_cleanup(ctx);
+        return true; /* non-fatal: fall back to SurfaceBits */
+    }
+
+    BYTE state = WTSVirtualChannelManagerGetDrdynvcState(ctx->gfx_vcm);
+
+    if (state == DRDYNVC_STATE_FAILED) {
+        WLRDP_LOG_WARN("DRDYNVC handshake failed, falling back to SurfaceBits");
+        gfx_cleanup(ctx);
+        return true;
+    }
+
+    if (state != DRDYNVC_STATE_READY)
+        return true; /* still handshaking */
+
+    /* DRDYNVC is ready — open the GFX channel */
+    WLRDP_LOG_INFO("DRDYNVC ready, opening GFX channel");
+
+    if (!gfx_open(ctx)) {
+        WLRDP_LOG_WARN("GFX open failed after DRDYNVC ready, "
+                        "falling back to SurfaceBits");
+        gfx_cleanup(ctx);
+        return true;
+    }
+
+    /* Surface creation is deferred until gfx_caps_advertise completes */
+    return true;
 }
 
 static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
@@ -398,13 +508,14 @@ static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
     RDPGFX_SURFACE_COMMAND cmd = {
         .surfaceId = ctx->gfx_surface_id,
         .codecId = RDPGFX_CODECID_AVC420,
-        .format = GFX_PIXEL_FORMAT_XRGB_8888,
+        .format = PIXEL_FORMAT_BGRX32,
         .left = 0,
         .top = 0,
         .right = width,
         .bottom = height,
-        .length = sizeof(avc420),
-        .data = (BYTE *)&avc420,
+        .length = len,
+        .data = data,
+        .extra = &avc420,
     };
 
     if (gfx->SurfaceCommand(gfx, &cmd) != CHANNEL_RC_OK) {
@@ -426,6 +537,7 @@ static bool send_surface_bits(freerdp_peer *client,
                                uint32_t width, uint32_t height)
 {
     rdpUpdate *update = client->context->update;
+    rdpSettings *settings = client->context->settings;
 
     SURFACE_BITS_COMMAND cmd = { 0 };
     cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
@@ -436,7 +548,7 @@ static bool send_surface_bits(freerdp_peer *client,
     cmd.bmp.bpp = 32;
     cmd.bmp.width = width;
     cmd.bmp.height = height;
-    cmd.bmp.codecID = 0;
+    cmd.bmp.codecID = freerdp_settings_get_uint32(settings, FreeRDP_NSCodecId);
     cmd.bmp.bitmapDataLength = len;
     cmd.bmp.bitmapData = data;
 
@@ -458,7 +570,7 @@ bool rdp_peer_send_frame(freerdp_peer *client,
 
     (void)is_keyframe; /* AVC420 metadata carries QP, not per-frame keyframe flag */
 
-    if (ctx->send_mode == WLRDP_SEND_GFX_AVC420 && ctx->gfx_context) {
+    if (ctx->send_mode == WLRDP_SEND_GFX_AVC420 && ctx->gfx_ready) {
         return send_gfx_avc420(ctx, data, len, width, height);
     }
 
