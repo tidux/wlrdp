@@ -14,6 +14,8 @@ enum wlrdp_send_mode {
     WLRDP_SEND_GFX_AVC420,    /* Phase 3: RDPGFX + H.264 */
 };
 
+typedef void (*rdp_peer_resize_cb)(void *data, uint32_t width, uint32_t height, uint32_t scale);
+
 struct wlrdp_peer_context {
     rdpContext base;
 
@@ -22,6 +24,10 @@ struct wlrdp_peer_context {
     uint32_t height;
     bool activated;
 
+    /* Resize callback */
+    rdp_peer_resize_cb on_resize;
+    void *on_resize_data;
+
     /* RDPGFX state */
     void *gfx_context;       /* RdpgfxServerContext* */
     void *gfx_vcm;           /* HANDLE from WTSOpenServerA */
@@ -29,6 +35,10 @@ struct wlrdp_peer_context {
     bool gfx_opened;
     bool gfx_ready;          /* true once DRDYNVC ready + GFX opened + surface created */
     uint32_t gfx_frame_id;
+
+    /* DISP state */
+    void *disp_context;      /* DispServerContext* */
+    bool disp_opened;
 
     enum wlrdp_send_mode send_mode;
 };
@@ -70,5 +80,10 @@ bool rdp_peer_check_vcm(freerdp_peer *client);
 bool rdp_peer_init_from_fd(freerdp_peer *client, int peer_fd,
                            const char *cert_file, const char *key_file,
                            struct wlrdp_input *input);
+
+/*
+ * Update the RDP peer's desktop size and recreate GFX surfaces if needed.
+ */
+void rdp_peer_update_size(freerdp_peer *client, uint32_t width, uint32_t height);
 
 #endif /* WLRDP_RDP_PEER_H */

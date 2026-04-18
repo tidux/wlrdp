@@ -184,6 +184,12 @@ bool input_init(struct wlrdp_input *inp, const char *display_name,
     return true;
 }
 
+void input_update_size(struct wlrdp_input *inp, uint32_t width, uint32_t height)
+{
+    inp->width = width;
+    inp->height = height;
+}
+
 void input_pointer_motion(struct wlrdp_input *inp, uint32_t x, uint32_t y)
 {
     zwlr_virtual_pointer_v1_motion_absolute(inp->vptr, get_time_ms(),

@@ -29,6 +29,7 @@ struct wlrdp_input {
 
 bool input_init(struct wlrdp_input *inp, const char *display_name,
                 uint32_t width, uint32_t height);
+void input_update_size(struct wlrdp_input *inp, uint32_t width, uint32_t height);
 void input_pointer_motion(struct wlrdp_input *inp, uint32_t x, uint32_t y);
 void input_pointer_button(struct wlrdp_input *inp, uint32_t button, bool pressed);
 void input_pointer_axis(struct wlrdp_input *inp, int32_t value);

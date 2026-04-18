@@ -89,26 +89,52 @@ static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name)
         return false;
     }
 
+    /* Many H.264 encoders (especially libx264 and hardware ones)
+     * require even dimensions for YUV420. */
+    uint32_t enc_width = enc->width & ~1;
+    uint32_t enc_height = enc->height & ~1;
+
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     if (!ctx) return false;
 
-    ctx->width = enc->width;
-    ctx->height = enc->height;
+    ctx->width = enc_width;
+    ctx->height = enc_height;
     ctx->time_base = (AVRational){1, 30};
     ctx->framerate = (AVRational){30, 1};
     ctx->gop_size = 60;        /* keyframe every 2 seconds at 30fps */
     ctx->max_b_frames = 0;     /* RDP doesn't benefit from B-frames */
-    ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    ctx->bit_rate = enc->width * enc->height * 2; /* ~2 bits/pixel */
+    ctx->bit_rate = enc_width * enc_height * 2; /* ~2 bits/pixel */
     ctx->thread_count = 1;     /* single-threaded for low latency */
 
-    /* Low-latency tuning */
-    av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
-    av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
-    av_opt_set(ctx->priv_data, "profile", "baseline", 0);
+    if (strcmp(name, "h264_vaapi") == 0) {
+        ctx->pix_fmt = AV_PIX_FMT_VAAPI;
+    } else {
+        ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    }
+
+    /* Apply encoder-specific low-latency tuning */
+    if (strcmp(name, "libx264") == 0) {
+        av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
+        av_opt_set(ctx->priv_data, "profile", "baseline", 0);
+    } else if (strcmp(name, "h264_nvenc") == 0) {
+        av_opt_set(ctx->priv_data, "preset", "p1", 0); /* p1 = fastest */
+        av_opt_set(ctx->priv_data, "tune", "ull", 0);  /* ull = ultra low latency */
+        av_opt_set(ctx->priv_data, "delay", "0", 0);
+    } else if (strcmp(name, "h264_vaapi") == 0) {
+        /* VAAPI often uses its own profile/entrypoint settings */
+    }
 
     if (avcodec_open2(ctx, codec, NULL) < 0) {
         WLRDP_LOG_INFO("H.264 encoder '%s' failed to open", name);
+        avcodec_free_context(&ctx);
+        return false;
+    }
+
+    /* VAAPI requires hardware frame allocation, which we don't support yet.
+     * For now, if vaapi was selected, we fail and try the next one. */
+    if (ctx->pix_fmt == AV_PIX_FMT_VAAPI) {
+        WLRDP_LOG_INFO("H.264 encoder '%s' requires VAAPI hardware frames (unsupported)", name);
         avcodec_free_context(&ctx);
         return false;
     }
@@ -136,7 +162,7 @@ static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name)
 
     struct SwsContext *sws = sws_getContext(
         enc->width, enc->height, AV_PIX_FMT_BGRA,
-        enc->width, enc->height, AV_PIX_FMT_YUV420P,
+        ctx->width, ctx->height, ctx->pix_fmt,
         SWS_FAST_BILINEAR, NULL, NULL, NULL);
     if (!sws) {
         av_packet_free(&pkt);
@@ -151,8 +177,8 @@ static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name)
     enc->sws_ctx = sws;
     enc->mode = WLRDP_ENCODER_H264;
 
-    WLRDP_LOG_INFO("encoder initialized (%ux%u, H.264 via %s)",
-                    enc->width, enc->height, name);
+    WLRDP_LOG_INFO("encoder initialized (%ux%u, aligned to %ux%u, H.264 via %s)",
+                    enc->width, enc->height, ctx->width, ctx->height, name);
     return true;
 }
 
