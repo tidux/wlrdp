@@ -5,6 +5,7 @@
 #include "input.h"
 #include "encoder.h"
 #include "clipboard.h"
+#include "audio.h"
 #include "rdp_peer.h"
 
 #include <freerdp/freerdp.h>
@@ -41,6 +42,8 @@ struct wlrdp_server {
     struct wlrdp_encoder encoder;
     struct wlrdp_clipboard clipboard;
     bool clipboard_active;
+    struct wlrdp_audio audio;
+    bool audio_active;
     freerdp_listener *listener;
     freerdp_peer *client;
 
@@ -190,6 +193,15 @@ static void on_peer_resize(void *data, uint32_t width, uint32_t height, uint32_t
     }
 }
 
+#ifdef WLRDP_HAVE_PIPEWIRE
+static void on_audio_data(void *data, const int16_t *samples, uint32_t n_frames)
+{
+    struct wlrdp_server *srv = data;
+    if (!srv->client_active || !srv->client) return;
+    rdp_peer_send_audio(srv->client, samples, n_frames);
+}
+#endif
+
 static void on_wl_clipboard_changed(void *data, const char *text, size_t len)
 {
     struct wlrdp_server *srv = data;
@@ -286,6 +298,8 @@ static bool accept_ipc_client(struct wlrdp_server *srv)
         pctx->on_resize_data = srv;
         if (srv->clipboard_active)
             pctx->clipboard = &srv->clipboard;
+        if (srv->audio_active)
+            pctx->audio = &srv->audio;
     }
 
     if (!client->Initialize(client)) {
@@ -334,6 +348,8 @@ static BOOL on_peer_accepted(freerdp_listener *listener,
         pctx->on_resize_data = srv;
         if (srv->clipboard_active)
             pctx->clipboard = &srv->clipboard;
+        if (srv->audio_active)
+            pctx->audio = &srv->audio;
     }
 
     if (!client->Initialize(client)) {
@@ -515,6 +531,14 @@ int main(int argc, char *argv[])
         srv.clipboard_active = true;
     }
 
+#ifdef WLRDP_HAVE_PIPEWIRE
+    if (!audio_init(&srv.audio, on_audio_data, &srv)) {
+        WLRDP_LOG_WARN("audio init failed, continuing without audio");
+    } else {
+        srv.audio_active = true;
+    }
+#endif
+
     /* Encoder is initialized per-client after capability negotiation */
 
     srv.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -533,6 +557,14 @@ int main(int argc, char *argv[])
     if (srv.clipboard_active) {
         clipboard_fd = clipboard_get_fd(&srv.clipboard);
         epoll_add_fd(srv.epoll_fd, clipboard_fd);
+    }
+
+    int audio_fd = -1;
+    if (srv.audio_active) {
+        audio_fd = audio_get_fd(&srv.audio);
+        if (audio_fd >= 0) {
+            epoll_add_fd(srv.epoll_fd, audio_fd);
+        }
     }
 
     if (standalone) {
@@ -619,6 +651,11 @@ int main(int argc, char *argv[])
                     WLRDP_LOG_WARN("clipboard dispatch error");
                     srv.clipboard_active = false;
                 }
+                continue;
+            }
+
+            if (srv.audio_active && audio_fd >= 0 && fd == audio_fd) {
+                audio_dispatch(&srv.audio);
                 continue;
             }
 
@@ -723,6 +760,9 @@ cleanup:
     }
     if (srv.encoder_initialized) {
         encoder_destroy(&srv.encoder);
+    }
+    if (srv.audio_active) {
+        audio_destroy(&srv.audio);
     }
     if (srv.clipboard_active) {
         clipboard_destroy(&srv.clipboard);
