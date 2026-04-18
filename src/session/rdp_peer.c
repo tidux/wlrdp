@@ -30,17 +30,30 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
 
-    /* Accept the first capability set that supports AVC420 */
+    /* Accept the first capability set that supports AVC420 by checking
+     * both version and the AVC420_ENABLED flag (per MS-RDPEGFX spec). */
     bool found_avc420 = false;
     uint32_t chosen = 0;
 
     for (uint32_t i = 0; i < pdu->capsSetCount; i++) {
-        if (pdu->capsSets[i].version >= RDPGFX_CAPVERSION_10) {
+        const RDPGFX_CAPSET *cap = &pdu->capsSets[i];
+        bool supports_avc = false;
+
+        if (cap->version >= RDPGFX_CAPVERSION_10) {
+            if (!(cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) {
+                supports_avc = true;
+            }
+        } else if (cap->version >= RDPGFX_CAPVERSION_81 &&
+                   (cap->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED)) {
+            supports_avc = true;
+        }
+
+        if (supports_avc) {
             chosen = i;
             found_avc420 = true;
             break;
         }
-        if (pdu->capsSets[i].version >= RDPGFX_CAPVERSION_81) {
+        if (cap->version >= RDPGFX_CAPVERSION_81) {
             chosen = i;
         }
     }
