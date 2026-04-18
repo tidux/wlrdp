@@ -4,6 +4,7 @@
 #include "capture.h"
 #include "input.h"
 #include "encoder.h"
+#include "clipboard.h"
 #include "rdp_peer.h"
 
 #include <freerdp/freerdp.h>
@@ -38,6 +39,8 @@ struct wlrdp_server {
     struct wlrdp_capture capture;
     struct wlrdp_input input;
     struct wlrdp_encoder encoder;
+    struct wlrdp_clipboard clipboard;
+    bool clipboard_active;
     freerdp_listener *listener;
     freerdp_peer *client;
 
@@ -187,6 +190,14 @@ static void on_peer_resize(void *data, uint32_t width, uint32_t height, uint32_t
     }
 }
 
+static void on_wl_clipboard_changed(void *data, const char *text, size_t len)
+{
+    struct wlrdp_server *srv = data;
+    (void)text; (void)len;
+    if (!srv->client_active) return;
+    clipboard_notify_rdp(&srv->clipboard);
+}
+
 static void disconnect_client(struct wlrdp_server *srv)
 {
     if (srv->vcm_fd >= 0) {
@@ -273,6 +284,8 @@ static bool accept_ipc_client(struct wlrdp_server *srv)
         pctx->height = srv->height;
         pctx->on_resize = on_peer_resize;
         pctx->on_resize_data = srv;
+        if (srv->clipboard_active)
+            pctx->clipboard = &srv->clipboard;
     }
 
     if (!client->Initialize(client)) {
@@ -319,6 +332,8 @@ static BOOL on_peer_accepted(freerdp_listener *listener,
         pctx->height = srv->height;
         pctx->on_resize = on_peer_resize;
         pctx->on_resize_data = srv;
+        if (srv->clipboard_active)
+            pctx->clipboard = &srv->clipboard;
     }
 
     if (!client->Initialize(client)) {
@@ -493,6 +508,13 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (!clipboard_init(&srv.clipboard, srv.comp.display_name,
+                        on_wl_clipboard_changed, &srv)) {
+        WLRDP_LOG_WARN("clipboard init failed, continuing without clipboard");
+    } else {
+        srv.clipboard_active = true;
+    }
+
     /* Encoder is initialized per-client after capability negotiation */
 
     srv.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -506,6 +528,12 @@ int main(int argc, char *argv[])
 
     int input_fd = input_get_fd(&srv.input);
     epoll_add_fd(srv.epoll_fd, input_fd);
+
+    int clipboard_fd = -1;
+    if (srv.clipboard_active) {
+        clipboard_fd = clipboard_get_fd(&srv.clipboard);
+        epoll_add_fd(srv.epoll_fd, clipboard_fd);
+    }
 
     if (standalone) {
         srv.listener = freerdp_listener_new();
@@ -557,6 +585,7 @@ int main(int argc, char *argv[])
 
         wl_display_flush(srv.capture.display);
         input_flush(&srv.input);
+        if (srv.clipboard_active) clipboard_flush(&srv.clipboard);
 
         struct epoll_event events[16];
         int nfds = epoll_wait(srv.epoll_fd, events, 16, 16);
@@ -581,6 +610,14 @@ int main(int argc, char *argv[])
                 if (input_dispatch(&srv.input) < 0) {
                     WLRDP_LOG_ERROR("Wayland input dispatch error");
                     g_running = 0;
+                }
+                continue;
+            }
+
+            if (srv.clipboard_active && fd == clipboard_fd) {
+                if (clipboard_dispatch(&srv.clipboard) < 0) {
+                    WLRDP_LOG_WARN("clipboard dispatch error");
+                    srv.clipboard_active = false;
                 }
                 continue;
             }
@@ -686,6 +723,9 @@ cleanup:
     }
     if (srv.encoder_initialized) {
         encoder_destroy(&srv.encoder);
+    }
+    if (srv.clipboard_active) {
+        clipboard_destroy(&srv.clipboard);
     }
     input_destroy(&srv.input);
     capture_destroy(&srv.capture);
