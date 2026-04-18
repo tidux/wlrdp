@@ -8,6 +8,7 @@
 #include <freerdp/peer.h>
 
 struct wlrdp_input;
+struct wlrdp_clipboard;
 
 enum wlrdp_send_mode {
     WLRDP_SEND_SURFACE_BITS,  /* Phase 1/2 fallback: SurfaceBits + NSCodec */
@@ -39,6 +40,11 @@ struct wlrdp_peer_context {
     /* DISP state */
     void *disp_context;      /* DispServerContext* */
     bool disp_opened;
+
+    /* CLIPRDR state */
+    void *cliprdr_context;     /* CliprdrServerContext* */
+    bool cliprdr_opened;
+    struct wlrdp_clipboard *clipboard;  /* set by main.c before activation */
 
     enum wlrdp_send_mode send_mode;
 };

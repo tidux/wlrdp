@@ -1,5 +1,6 @@
 #include "rdp_peer.h"
 #include "input.h"
+#include "clipboard.h"
 #include "common.h"
 
 #include <freerdp/freerdp.h>
@@ -222,6 +223,12 @@ static void gfx_cleanup(struct wlrdp_peer_context *ctx)
         }
         rdpgfx_server_context_free(gfx);
         ctx->gfx_context = NULL;
+    }
+
+    if (ctx->cliprdr_opened && ctx->clipboard) {
+        clipboard_close_cliprdr(ctx->clipboard);
+        ctx->cliprdr_context = NULL;
+        ctx->cliprdr_opened = false;
     }
 
     if (ctx->disp_context) {
@@ -627,6 +634,15 @@ bool rdp_peer_check_vcm(freerdp_peer *client)
 
     if (!disp_open(ctx)) {
         WLRDP_LOG_WARN("DISP open failed, dynamic resizing may not work");
+    }
+
+    if (ctx->clipboard) {
+        if (clipboard_open_cliprdr(ctx->clipboard, ctx->gfx_vcm)) {
+            ctx->cliprdr_context = ctx->clipboard->cliprdr_context;
+            ctx->cliprdr_opened = true;
+        } else {
+            WLRDP_LOG_WARN("CLIPRDR open failed, clipboard will not work");
+        }
     }
 
     /* Surface creation is deferred until gfx_caps_advertise completes */

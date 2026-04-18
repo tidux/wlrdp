@@ -42,6 +42,10 @@ void clipboard_destroy(struct wlrdp_clipboard *cb);
 /* Set the Wayland clipboard to the given text (called when RDP client pastes) */
 void clipboard_set_text(struct wlrdp_clipboard *cb, const char *text, size_t len);
 
+/* Open/close the CLIPRDR dynamic virtual channel */
+bool clipboard_open_cliprdr(struct wlrdp_clipboard *cb, void *vcm);
+void clipboard_close_cliprdr(struct wlrdp_clipboard *cb);
+
 /* Notify the RDP client that the Wayland clipboard changed */
 void clipboard_notify_rdp(struct wlrdp_clipboard *cb);
 

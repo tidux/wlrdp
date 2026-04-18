@@ -8,6 +8,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <freerdp/channels/cliprdr.h>
+#include <freerdp/server/cliprdr.h>
+#include <winpr/user.h>
+#include <winpr/string.h>
+
 #define CLIPBOARD_MIME_TYPE "text/plain;charset=utf-8"
 #define CLIPBOARD_MAX_SIZE (16 * 1024 * 1024) /* 16 MiB limit */
 
@@ -292,10 +297,171 @@ void clipboard_set_text(struct wlrdp_clipboard *cb, const char *text, size_t len
     wl_display_flush(cb->display);
 }
 
+/* --- CLIPRDR server callbacks --- */
+
+static UINT on_cliprdr_client_capabilities(CliprdrServerContext *context,
+                                           const CLIPRDR_CAPABILITIES *caps)
+{
+    (void)context; (void)caps;
+    WLRDP_LOG_INFO("CLIPRDR: client capabilities received");
+    return CHANNEL_RC_OK;
+}
+
+static UINT on_cliprdr_client_format_list(CliprdrServerContext *context,
+                                          const CLIPRDR_FORMAT_LIST *list)
+{
+    (void)context->custom; /* cb used only after format data arrives */
+
+    /* Check if client has text on its clipboard */
+    bool has_text = false;
+    for (uint32_t i = 0; i < list->numFormats; i++) {
+        uint32_t id = list->formats[i].formatId;
+        if (id == CF_TEXT || id == CF_UNICODETEXT || id == CF_OEMTEXT) {
+            has_text = true;
+            break;
+        }
+    }
+
+    /* Acknowledge the format list */
+    CLIPRDR_FORMAT_LIST_RESPONSE resp = {
+        .common = { .msgFlags = CB_RESPONSE_OK },
+    };
+    context->ServerFormatListResponse(context, &resp);
+
+    if (has_text) {
+        /* Request the text data from the client */
+        CLIPRDR_FORMAT_DATA_REQUEST req = {
+            .requestedFormatId = CF_UNICODETEXT,
+        };
+        context->ServerFormatDataRequest(context, &req);
+    }
+
+    return CHANNEL_RC_OK;
+}
+
+static UINT on_cliprdr_client_format_data_response(
+    CliprdrServerContext *context,
+    const CLIPRDR_FORMAT_DATA_RESPONSE *resp)
+{
+    struct wlrdp_clipboard *cb = context->custom;
+
+    if (resp->common.msgFlags != CB_RESPONSE_OK) return CHANNEL_RC_OK;
+
+    const BYTE *data = resp->requestedFormatData;
+    uint32_t len = resp->common.dataLen;
+    if (!data || len == 0) return CHANNEL_RC_OK;
+
+    /* Convert from UTF-16LE (CF_UNICODETEXT) to UTF-8 */
+    size_t utf8_len = 0;
+    char *utf8 = ConvertWCharNToUtf8Alloc((const WCHAR *)data,
+                                           len / sizeof(WCHAR), &utf8_len);
+    if (utf8 && utf8_len > 0) {
+        /* Strip trailing null if present */
+        while (utf8_len > 0 && utf8[utf8_len - 1] == '\0') utf8_len--;
+        clipboard_set_text(cb, utf8, utf8_len);
+        WLRDP_LOG_INFO("CLIPRDR: received %zu bytes text from client", utf8_len);
+    }
+    free(utf8);
+
+    return CHANNEL_RC_OK;
+}
+
+static UINT on_cliprdr_client_format_data_request(
+    CliprdrServerContext *context,
+    const CLIPRDR_FORMAT_DATA_REQUEST *req)
+{
+    struct wlrdp_clipboard *cb = context->custom;
+
+    CLIPRDR_FORMAT_DATA_RESPONSE resp = {
+        .common = { .msgFlags = CB_RESPONSE_FAIL },
+    };
+
+    if (cb->wl_clipboard_text && cb->wl_clipboard_len > 0 &&
+        (req->requestedFormatId == CF_UNICODETEXT ||
+         req->requestedFormatId == CF_TEXT)) {
+
+        if (req->requestedFormatId == CF_UNICODETEXT) {
+            size_t wlen = 0;
+            WCHAR *wstr = ConvertUtf8NToWCharAlloc(cb->wl_clipboard_text,
+                                                    cb->wl_clipboard_len, &wlen);
+            if (wstr) {
+                resp.common.msgFlags = CB_RESPONSE_OK;
+                resp.common.dataLen = (wlen + 1) * sizeof(WCHAR);
+                resp.requestedFormatData = (const BYTE *)wstr;
+                context->ServerFormatDataResponse(context, &resp);
+                free(wstr);
+                return CHANNEL_RC_OK;
+            }
+        } else {
+            /* CF_TEXT: send as-is (ASCII subset) */
+            resp.common.msgFlags = CB_RESPONSE_OK;
+            resp.common.dataLen = cb->wl_clipboard_len + 1;
+            resp.requestedFormatData = (const BYTE *)cb->wl_clipboard_text;
+            context->ServerFormatDataResponse(context, &resp);
+            return CHANNEL_RC_OK;
+        }
+    }
+
+    context->ServerFormatDataResponse(context, &resp);
+    return CHANNEL_RC_OK;
+}
+
+/* --- CLIPRDR open/close --- */
+
+bool clipboard_open_cliprdr(struct wlrdp_clipboard *cb, void *vcm)
+{
+    CliprdrServerContext *cliprdr = cliprdr_server_context_new(vcm);
+    if (!cliprdr) {
+        WLRDP_LOG_WARN("failed to create CLIPRDR server context");
+        return false;
+    }
+
+    cliprdr->custom = cb;
+    cliprdr->useLongFormatNames = TRUE;
+    cliprdr->streamFileClipEnabled = FALSE;
+    cliprdr->canLockClipData = FALSE;
+    cliprdr->autoInitializationSequence = TRUE;
+
+    cliprdr->ClientCapabilities = on_cliprdr_client_capabilities;
+    cliprdr->ClientFormatList = on_cliprdr_client_format_list;
+    cliprdr->ClientFormatDataResponse = on_cliprdr_client_format_data_response;
+    cliprdr->ClientFormatDataRequest = on_cliprdr_client_format_data_request;
+
+    if (cliprdr->Open(cliprdr) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("CLIPRDR channel Open failed");
+        cliprdr_server_context_free(cliprdr);
+        return false;
+    }
+
+    cb->cliprdr_context = cliprdr;
+    WLRDP_LOG_INFO("CLIPRDR channel opened");
+    return true;
+}
+
+void clipboard_close_cliprdr(struct wlrdp_clipboard *cb)
+{
+    if (!cb->cliprdr_context) return;
+    CliprdrServerContext *cliprdr = cb->cliprdr_context;
+    cliprdr->Close(cliprdr);
+    cliprdr_server_context_free(cliprdr);
+    cb->cliprdr_context = NULL;
+}
+
 void clipboard_notify_rdp(struct wlrdp_clipboard *cb)
 {
-    /* Stub -- real implementation added when CLIPRDR channel is wired (Task 4) */
-    if (!cb->cliprdr_context) return;
+    CliprdrServerContext *cliprdr = cb->cliprdr_context;
+    if (!cliprdr) return;
+
+    CLIPRDR_FORMAT formats[] = {
+        { .formatId = CF_UNICODETEXT, .formatName = NULL },
+        { .formatId = CF_TEXT, .formatName = NULL },
+    };
+    CLIPRDR_FORMAT_LIST list = {
+        .numFormats = 2,
+        .formats = formats,
+    };
+
+    cliprdr->ServerFormatList(cliprdr, &list);
 }
 
 int clipboard_get_fd(struct wlrdp_clipboard *cb)
