@@ -151,6 +151,42 @@ static void on_frame_ready(void *data, uint8_t *pixels,
     capture_request_frame(&srv->capture);
 }
 
+static void on_peer_resize(void *data, uint32_t width, uint32_t height, uint32_t scale)
+{
+    struct wlrdp_server *srv = data;
+
+    /* width/height from the RDP client are already physical pixel dimensions.
+     * scale is the client's DPI scale factor (e.g. 200 for Retina 2x).
+     * We pass scale to wlr-randr so Wayland apps render at the right DPI. */
+
+    if (srv->width == (int)width && srv->height == (int)height)
+        return;
+
+    WLRDP_LOG_INFO("resizing compositor to %ux%u (scale %u%%)",
+                    width, height, scale);
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "WAYLAND_DISPLAY=%s wlr-randr --output HEADLESS-1 --custom-mode %dx%d --scale %g 2>/dev/null",
+             srv->comp.display_name, width, height, (double)scale / 100.0);
+    if (system(cmd) != 0) {
+        WLRDP_LOG_WARN("failed to resize compositor output via wlr-randr");
+    }
+
+    srv->width = width;
+    srv->height = height;
+
+    if (srv->client) {
+        rdp_peer_update_size(srv->client, width, height);
+    }
+
+    input_update_size(&srv->input, width, height);
+
+    if (srv->encoder_initialized) {
+        init_encoder_for_client(srv);
+    }
+}
+
 static void disconnect_client(struct wlrdp_server *srv)
 {
     if (srv->vcm_fd >= 0) {
@@ -230,16 +266,13 @@ static bool accept_ipc_client(struct wlrdp_server *srv)
         return false;
     }
 
-    /* Force desktop size to match our compositor */
-    freerdp_settings_set_uint32(client->context->settings,
-                                FreeRDP_DesktopWidth, srv->width);
-    freerdp_settings_set_uint32(client->context->settings,
-                                FreeRDP_DesktopHeight, srv->height);
     {
         struct wlrdp_peer_context *pctx =
             (struct wlrdp_peer_context *)client->context;
         pctx->width = srv->width;
         pctx->height = srv->height;
+        pctx->on_resize = on_peer_resize;
+        pctx->on_resize_data = srv;
     }
 
     if (!client->Initialize(client)) {
@@ -279,16 +312,13 @@ static BOOL on_peer_accepted(freerdp_listener *listener,
         return FALSE;
     }
 
-    /* Force desktop size to match our compositor */
-    freerdp_settings_set_uint32(client->context->settings,
-                                FreeRDP_DesktopWidth, srv->width);
-    freerdp_settings_set_uint32(client->context->settings,
-                                FreeRDP_DesktopHeight, srv->height);
     {
         struct wlrdp_peer_context *pctx =
             (struct wlrdp_peer_context *)client->context;
         pctx->width = srv->width;
         pctx->height = srv->height;
+        pctx->on_resize = on_peer_resize;
+        pctx->on_resize_data = srv;
     }
 
     if (!client->Initialize(client)) {
