@@ -13,6 +13,8 @@
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/codec/color.h>
 #include <freerdp/server/rdpgfx.h>
+#include <freerdp/server/disp.h>
+#include <freerdp/pointer.h>
 #include <winpr/wtsapi.h>
 #include <linux/input-event-codes.h>
 
@@ -158,7 +160,7 @@ static bool gfx_open(struct wlrdp_peer_context *ctx)
     return true;
 }
 
-static bool gfx_create_surface(struct wlrdp_peer_context *ctx,
+bool gfx_create_surface(struct wlrdp_peer_context *ctx,
                                 uint32_t width, uint32_t height)
 {
     RdpgfxServerContext *gfx = ctx->gfx_context;
@@ -221,6 +223,16 @@ static void gfx_cleanup(struct wlrdp_peer_context *ctx)
         rdpgfx_server_context_free(gfx);
         ctx->gfx_context = NULL;
     }
+
+    if (ctx->disp_context) {
+        DispServerContext *disp = ctx->disp_context;
+        if (ctx->disp_opened) {
+            disp->Close(disp);
+        }
+        disp_server_context_free(disp);
+        ctx->disp_context = NULL;
+    }
+
     if (ctx->gfx_vcm) {
         WTSCloseServer(ctx->gfx_vcm);
         ctx->gfx_vcm = NULL;
@@ -228,6 +240,57 @@ static void gfx_cleanup(struct wlrdp_peer_context *ctx)
     ctx->gfx_opened = false;
     ctx->gfx_ready = false;
     ctx->gfx_surface_id = 0;
+    ctx->disp_opened = false;
+}
+
+/* --- DISP channel callbacks --- */
+
+static UINT on_disp_monitor_layout(DispServerContext *context,
+                                   const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *pdu)
+{
+    freerdp_peer *client = context->rdpcontext->peer;
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+
+    if (pdu->NumMonitors < 1) return CHANNEL_RC_OK;
+
+    const DISPLAY_CONTROL_MONITOR_LAYOUT *mon = &pdu->Monitors[0];
+    uint32_t width = mon->Width;
+    uint32_t height = mon->Height;
+    uint32_t scale = mon->DesktopScaleFactor;
+    if (scale == 0) scale = 100;
+
+    WLRDP_LOG_INFO("DISP: client requested resize to %ux%u (scale %u%%)",
+                    width, height, scale);
+
+    if (ctx->on_resize) {
+        ctx->on_resize(ctx->on_resize_data, width, height, scale);
+    }
+
+    return CHANNEL_RC_OK;
+}
+
+static bool disp_open(struct wlrdp_peer_context *ctx)
+{
+    DispServerContext *disp = disp_server_context_new(ctx->gfx_vcm);
+    if (!disp) {
+        WLRDP_LOG_WARN("failed to create DISP server context");
+        return false;
+    }
+
+    disp->rdpcontext = &ctx->base;
+    disp->DispMonitorLayout = on_disp_monitor_layout;
+
+    if (!disp->Open(disp)) {
+        WLRDP_LOG_WARN("DISP channel Open failed");
+        disp_server_context_free(disp);
+        return false;
+    }
+
+    ctx->disp_context = disp;
+    ctx->disp_opened = true;
+    WLRDP_LOG_INFO("DISP channel opened");
+    return true;
 }
 
 /* --- RDP input callbacks --- */
@@ -321,19 +384,72 @@ static BOOL on_extended_mouse_event(rdpInput *input, UINT16 flags,
 
 /* --- Peer lifecycle callbacks --- */
 
+static uint32_t get_desktop_scale(rdpSettings *settings)
+{
+    uint32_t scale = freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
+    if (scale == 0) scale = 100;
+    return scale;
+}
+
+static BOOL on_desktop_resize(rdpContext *context)
+{
+    freerdp_peer *client = context->peer;
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+    rdpSettings *settings = client->context->settings;
+
+    uint32_t width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+    uint32_t height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+    uint32_t scale = get_desktop_scale(settings);
+
+    WLRDP_LOG_INFO("client requested desktop resize to %ux%u (scale %u%%)",
+                    width, height, scale);
+
+    if (ctx->on_resize) {
+        ctx->on_resize(ctx->on_resize_data, width, height, scale);
+    }
+
+    return TRUE;
+}
+
+static BOOL on_remote_monitors(rdpContext *context, UINT32 count,
+                               const MONITOR_DEF *monitors)
+{
+    freerdp_peer *client = context->peer;
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+    rdpSettings *settings = client->context->settings;
+
+    if (count < 1) return TRUE;
+
+    uint32_t width = monitors[0].right - monitors[0].left + 1;
+    uint32_t height = monitors[0].bottom - monitors[0].top + 1;
+    uint32_t scale = get_desktop_scale(settings);
+
+    WLRDP_LOG_INFO("client requested remote monitors change to %ux%u (scale %u%%)",
+                    width, height, scale);
+
+    if (ctx->on_resize) {
+        ctx->on_resize(ctx->on_resize_data, width, height, scale);
+    }
+
+    return TRUE;
+}
+
 static BOOL on_post_connect(freerdp_peer *client)
 {
     rdpSettings *settings = client->context->settings;
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
 
-    /* Override client-requested size with our compositor dimensions */
-    freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, ctx->width);
-    freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, ctx->height);
-
     WLRDP_LOG_INFO("RDP client connected: %ux%u %ubpp",
-                    ctx->width, ctx->height,
+                    freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
+                    freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight),
                     freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth));
+
+    WLRDP_LOG_INFO("client scale factors: desktop=%u, device=%u",
+                    freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor),
+                    freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor));
 
     WLRDP_LOG_INFO("negotiated: NSCodec=%d SurfaceCommands=%d GfxH264=%d",
         freerdp_settings_get_bool(settings, FreeRDP_NSCodec),
@@ -352,12 +468,34 @@ static BOOL on_activate(freerdp_peer *client)
 {
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
+    rdpSettings *settings = client->context->settings;
 
     ctx->activated = true;
 
-    WLRDP_LOG_INFO("RDP peer activated (send_mode=%s)",
+    uint32_t client_width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+    uint32_t client_height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+    uint32_t scale = get_desktop_scale(settings);
+
+    WLRDP_LOG_INFO("RDP peer activated (send_mode=%s, res=%ux%u, scale=%u%%)",
                     ctx->send_mode == WLRDP_SEND_GFX_AVC420
-                        ? "GFX_AVC420" : "SurfaceBits");
+                        ? "GFX_AVC420" : "SurfaceBits",
+                    client_width, client_height, scale);
+
+    /* Hide the client's local cursor. The server cursor is composited
+     * into the frame by cage, so the client must not draw its own. */
+    rdpPointerUpdate *pointer = client->context->update->pointer;
+    POINTER_SYSTEM_UPDATE system_pointer = { .type = SYSPTR_NULL };
+    pointer->PointerSystem(client->context, &system_pointer);
+
+    /* Adopt client resolution if different from our current resolution */
+    if (client_width != ctx->width || client_height != ctx->height) {
+        WLRDP_LOG_INFO("adopting client resolution on activation: %ux%u (scale %u%%)",
+                        client_width, client_height, scale);
+        if (ctx->on_resize) {
+            ctx->on_resize(ctx->on_resize_data, client_width, client_height, scale);
+        }
+    }
+
     return TRUE;
 }
 
@@ -404,12 +542,19 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE);
 
+    /* Dynamic Resolution / Monitor Layout */
+    freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, TRUE);
+
     /* Pointer settings */
     freerdp_settings_set_uint32(settings, FreeRDP_LargePointerFlag, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_SuppressOutput, TRUE);
 
     client->PostConnect = on_post_connect;
     client->Activate = on_activate;
+    client->context->update->DesktopResize = on_desktop_resize;
+    client->context->update->RemoteMonitors = on_remote_monitors;
     client->context->input->KeyboardEvent = on_keyboard_event;
     client->context->input->MouseEvent = on_mouse_event;
     client->context->input->ExtendedMouseEvent = on_extended_mouse_event;
@@ -473,14 +618,15 @@ bool rdp_peer_check_vcm(freerdp_peer *client)
     if (state != DRDYNVC_STATE_READY)
         return true; /* still handshaking */
 
-    /* DRDYNVC is ready — open the GFX channel */
-    WLRDP_LOG_INFO("DRDYNVC ready, opening GFX channel");
+    /* DRDYNVC is ready — open the channels */
+    WLRDP_LOG_INFO("DRDYNVC ready, opening dynamic channels");
 
     if (!gfx_open(ctx)) {
-        WLRDP_LOG_WARN("GFX open failed after DRDYNVC ready, "
-                        "falling back to SurfaceBits");
-        gfx_cleanup(ctx);
-        return true;
+        WLRDP_LOG_WARN("GFX open failed, falling back to SurfaceBits");
+    }
+
+    if (!disp_open(ctx)) {
+        WLRDP_LOG_WARN("DISP open failed, dynamic resizing may not work");
     }
 
     /* Surface creation is deferred until gfx_caps_advertise completes */
@@ -600,4 +746,17 @@ bool rdp_peer_init_from_fd(freerdp_peer *client, int peer_fd,
 {
     client->sockfd = peer_fd;
     return rdp_peer_init(client, cert_file, key_file, input);
+}
+
+void rdp_peer_update_size(freerdp_peer *client, uint32_t width, uint32_t height)
+{
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+
+    ctx->width = width;
+    ctx->height = height;
+
+    if (ctx->gfx_ready && ctx->gfx_context) {
+        gfx_create_surface(ctx, width, height);
+    }
 }
