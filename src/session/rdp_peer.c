@@ -404,6 +404,10 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE);
 
+    /* Pointer settings */
+    freerdp_settings_set_uint32(settings, FreeRDP_LargePointerFlag, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_SuppressOutput, TRUE);
+
     client->PostConnect = on_post_connect;
     client->Activate = on_activate;
     client->context->input->KeyboardEvent = on_keyboard_event;

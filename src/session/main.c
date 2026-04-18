@@ -309,7 +309,10 @@ static bool epoll_add_fd(int epoll_fd, int fd)
         .events = EPOLLIN,
         .data.fd = fd,
     };
-    return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+        return (errno == EEXIST);
+    }
+    return true;
 }
 
 static void epoll_add_vcm(struct wlrdp_server *srv)
@@ -323,6 +326,23 @@ static void epoll_add_vcm(struct wlrdp_server *srv)
         srv->vcm_fd = fd;
         WLRDP_LOG_INFO("VCM fd %d added to epoll", fd);
     }
+}
+
+static void epoll_update_client(struct wlrdp_server *srv)
+{
+    if (!srv->client)
+        return;
+
+    HANDLE events[32];
+    DWORD count = srv->client->GetEventHandles(srv->client, events, 32);
+    for (DWORD i = 0; i < count; i++) {
+        int fd = GetEventFileDescriptor(events[i]);
+        if (fd >= 0) {
+            epoll_add_fd(srv->epoll_fd, fd);
+        }
+    }
+
+    epoll_add_vcm(srv);
 }
 
 static void generate_self_signed_cert(const char *cert_file,
@@ -454,6 +474,9 @@ int main(int argc, char *argv[])
     int capture_fd = capture_get_fd(&srv.capture);
     epoll_add_fd(srv.epoll_fd, capture_fd);
 
+    int input_fd = input_get_fd(&srv.input);
+    epoll_add_fd(srv.epoll_fd, input_fd);
+
     if (standalone) {
         srv.listener = freerdp_listener_new();
         if (!srv.listener) {
@@ -518,7 +541,15 @@ int main(int argc, char *argv[])
 
             if (fd == capture_fd) {
                 if (capture_dispatch(&srv.capture) < 0) {
-                    WLRDP_LOG_ERROR("Wayland dispatch error");
+                    WLRDP_LOG_ERROR("Wayland capture dispatch error");
+                    g_running = 0;
+                }
+                continue;
+            }
+
+            if (fd == input_fd) {
+                if (input_dispatch(&srv.input) < 0) {
+                    WLRDP_LOG_ERROR("Wayland input dispatch error");
                     g_running = 0;
                 }
                 continue;
@@ -554,9 +585,10 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            /* Pick up VCM fd once post_connect creates it */
-            if (srv.vcm_fd < 0)
-                epoll_add_vcm(&srv);
+            input_flush(&srv.input);
+
+            /* Pick up new fds (socket, VCM, etc.) */
+            epoll_update_client(&srv);
 
             /* Always pump VCM to process GFX responses */
             if (!rdp_peer_check_vcm(srv.client)) {

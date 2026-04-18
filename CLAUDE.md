@@ -57,5 +57,6 @@ Meson with C11. Wayland protocol C bindings are generated at build time via `way
 ## Development Notes
 
 - This is a Linux-only project (epoll, SCM_RIGHTS, PAM). Development requires a Linux environment or the provided devcontainer.  If the host system is MacOS and Claude is not running in VSCode, use MCP tools to start, rebuild, restart, or run commands inside the devcontainer.
+- If xfreerdp is available on the host system, test the server with the following command: `xfreerdp /u:developer /p:developer /cert:ignore /v:localhost /gfx:AVC420`
 - H.264 encoding and PipeWire capture are planned but currently disabled (`meson_options.txt`).
 - Frame data uses raw BGRX pixels (no compression yet); the vertical flip in `session/main.c:on_frame_ready` is needed because screencopy gives top-down but SurfaceBits expects bottom-up.
