@@ -9,6 +9,7 @@
 
 struct wlrdp_input;
 struct wlrdp_clipboard;
+struct wlrdp_audio;
 
 enum wlrdp_send_mode {
     WLRDP_SEND_SURFACE_BITS,  /* Phase 1/2 fallback: SurfaceBits + NSCodec */
@@ -45,6 +46,12 @@ struct wlrdp_peer_context {
     void *cliprdr_context;     /* CliprdrServerContext* */
     bool cliprdr_opened;
     struct wlrdp_clipboard *clipboard;  /* set by main.c before activation */
+
+    /* RDPSND state */
+    void *rdpsnd_context;      /* RdpsndServerContext* */
+    bool rdpsnd_opened;
+    bool rdpsnd_ready;         /* true after Activated callback */
+    struct wlrdp_audio *audio; /* set by main.c before activation */
 
     enum wlrdp_send_mode send_mode;
 };
@@ -91,5 +98,12 @@ bool rdp_peer_init_from_fd(freerdp_peer *client, int peer_fd,
  * Update the RDP peer's desktop size and recreate GFX surfaces if needed.
  */
 void rdp_peer_update_size(freerdp_peer *client, uint32_t width, uint32_t height);
+
+/*
+ * Send audio samples to the RDP client via RDPSND.
+ * Returns true on success.
+ */
+bool rdp_peer_send_audio(freerdp_peer *client, const int16_t *samples,
+                         uint32_t n_frames);
 
 #endif /* WLRDP_RDP_PEER_H */

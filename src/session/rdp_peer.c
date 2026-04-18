@@ -15,6 +15,8 @@
 #include <freerdp/codec/color.h>
 #include <freerdp/server/rdpgfx.h>
 #include <freerdp/server/disp.h>
+#include <freerdp/server/rdpsnd.h>
+#include <freerdp/codec/audio.h>
 #include <freerdp/pointer.h>
 #include <winpr/wtsapi.h>
 #include <linux/input-event-codes.h>
@@ -225,6 +227,17 @@ static void gfx_cleanup(struct wlrdp_peer_context *ctx)
         ctx->gfx_context = NULL;
     }
 
+    if (ctx->rdpsnd_context) {
+        RdpsndServerContext *rdpsnd = ctx->rdpsnd_context;
+        if (ctx->rdpsnd_opened) {
+            rdpsnd->Stop(rdpsnd);
+        }
+        rdpsnd_server_context_free(rdpsnd);
+        ctx->rdpsnd_context = NULL;
+        ctx->rdpsnd_opened = false;
+        ctx->rdpsnd_ready = false;
+    }
+
     if (ctx->cliprdr_opened && ctx->clipboard) {
         clipboard_close_cliprdr(ctx->clipboard);
         ctx->cliprdr_context = NULL;
@@ -297,6 +310,98 @@ static bool disp_open(struct wlrdp_peer_context *ctx)
     ctx->disp_context = disp;
     ctx->disp_opened = true;
     WLRDP_LOG_INFO("DISP channel opened");
+    return true;
+}
+
+/* --- RDPSND channel --- */
+
+static void on_rdpsnd_activated(RdpsndServerContext *context)
+{
+    freerdp_peer *client = context->rdpcontext->peer;
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+
+    /* Find a PCM format the client supports */
+    bool found = false;
+    for (UINT16 i = 0; i < context->num_client_formats; i++) {
+        const AUDIO_FORMAT *fmt = &context->client_formats[i];
+        if (fmt->wFormatTag == WAVE_FORMAT_PCM &&
+            fmt->nChannels == 2 &&
+            fmt->nSamplesPerSec == 44100 &&
+            fmt->wBitsPerSample == 16) {
+            context->SelectFormat(context, i);
+            found = true;
+            WLRDP_LOG_INFO("RDPSND: selected client format %u (PCM 44100/16/2)", i);
+            break;
+        }
+    }
+
+    if (!found) {
+        WLRDP_LOG_WARN("RDPSND: no compatible PCM format found");
+        return;
+    }
+
+    ctx->rdpsnd_ready = true;
+    WLRDP_LOG_INFO("RDPSND: activated and ready");
+}
+
+static bool rdpsnd_open(struct wlrdp_peer_context *ctx)
+{
+    RdpsndServerContext *rdpsnd = rdpsnd_server_context_new(ctx->gfx_vcm);
+    if (!rdpsnd) {
+        WLRDP_LOG_WARN("failed to create RDPSND server context");
+        return false;
+    }
+
+    rdpsnd->rdpcontext = &ctx->base;
+    rdpsnd->use_dynamic_virtual_channel = TRUE;
+
+    /* Advertise PCM S16LE 44100 Hz stereo */
+    static AUDIO_FORMAT server_formats[] = {
+        {
+            .wFormatTag = WAVE_FORMAT_PCM,
+            .nChannels = 2,
+            .nSamplesPerSec = 44100,
+            .nAvgBytesPerSec = 44100 * 2 * 2,
+            .nBlockAlign = 4,
+            .wBitsPerSample = 16,
+            .cbSize = 0,
+            .data = NULL,
+        },
+    };
+    rdpsnd->server_formats = server_formats;
+    rdpsnd->num_server_formats = 1;
+
+    static AUDIO_FORMAT src_format = {
+        .wFormatTag = WAVE_FORMAT_PCM,
+        .nChannels = 2,
+        .nSamplesPerSec = 44100,
+        .nAvgBytesPerSec = 44100 * 2 * 2,
+        .nBlockAlign = 4,
+        .wBitsPerSample = 16,
+        .cbSize = 0,
+        .data = NULL,
+    };
+    rdpsnd->src_format = &src_format;
+    rdpsnd->latency = 50; /* 50ms buffer */
+
+    rdpsnd->Activated = on_rdpsnd_activated;
+
+    if (rdpsnd->Initialize(rdpsnd, FALSE) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("RDPSND Initialize failed");
+        rdpsnd_server_context_free(rdpsnd);
+        return false;
+    }
+
+    if (rdpsnd->Start(rdpsnd) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("RDPSND Start failed");
+        rdpsnd_server_context_free(rdpsnd);
+        return false;
+    }
+
+    ctx->rdpsnd_context = rdpsnd;
+    ctx->rdpsnd_opened = true;
+    WLRDP_LOG_INFO("RDPSND channel opened");
     return true;
 }
 
@@ -645,6 +750,10 @@ bool rdp_peer_check_vcm(freerdp_peer *client)
         }
     }
 
+    if (!rdpsnd_open(ctx)) {
+        WLRDP_LOG_WARN("RDPSND open failed, audio will not work");
+    }
+
     /* Surface creation is deferred until gfx_caps_advertise completes */
     return true;
 }
@@ -775,4 +884,25 @@ void rdp_peer_update_size(freerdp_peer *client, uint32_t width, uint32_t height)
     if (ctx->gfx_ready && ctx->gfx_context) {
         gfx_create_surface(ctx, width, height);
     }
+}
+
+bool rdp_peer_send_audio(freerdp_peer *client, const int16_t *samples,
+                         uint32_t n_frames)
+{
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+
+    if (!ctx->rdpsnd_ready || !ctx->rdpsnd_context) return false;
+
+    RdpsndServerContext *rdpsnd = ctx->rdpsnd_context;
+
+    /* Process any pending RDPSND messages */
+    rdpsnd_server_handle_messages(rdpsnd);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    UINT16 timestamp = (UINT16)((ts.tv_sec * 1000 + ts.tv_nsec / 1000000) & 0xFFFF);
+
+    UINT rc = rdpsnd->SendSamples(rdpsnd, samples, n_frames, timestamp);
+    return (rc == CHANNEL_RC_OK);
 }
