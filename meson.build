@@ -26,6 +26,13 @@ if have_h264
     add_project_arguments('-DWLRDP_HAVE_H264=1', language: 'c')
 endif
 
+pw_opt = get_option('enable-pipewire')
+pipewire_dep = dependency('libpipewire-0.3', required: pw_opt)
+have_pipewire = pipewire_dep.found()
+if have_pipewire
+    add_project_arguments('-DWLRDP_HAVE_PIPEWIRE=1', language: 'c')
+endif
+
 wayland_scanner = find_program(
     wayland_scanner_dep.get_variable('wayland_scanner'),
 )

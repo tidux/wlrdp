@@ -5,6 +5,8 @@ session_sources = files(
     'input.c',
     'encoder.c',
     'rdp_peer.c',
+    'clipboard.c',
+    'audio.c',
 )
 
 session_deps = [
@@ -19,6 +21,10 @@ session_deps = [
 
 if have_h264
     session_deps += [libavcodec_dep, libavutil_dep, libswscale_dep]
+endif
+
+if have_pipewire
+    session_deps += [pipewire_dep]
 endif
 
 executable('wlrdp-session',

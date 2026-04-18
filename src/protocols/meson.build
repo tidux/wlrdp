@@ -2,6 +2,7 @@ protocols = [
     'wlr-screencopy-unstable-v1',
     'wlr-virtual-pointer-unstable-v1',
     'virtual-keyboard-unstable-v1',
+    'ext-data-control-v1',
 ]
 
 protocol_sources = []

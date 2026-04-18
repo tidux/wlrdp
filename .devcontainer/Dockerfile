@@ -32,6 +32,9 @@ RUN dnf install -y \
     libva-devel \
     mesa-va-drivers \
     labwc \
+    pipewire-devel \
+    wireplumber \
+    wl-clipboard \
     && dnf clean all
 
 # Create test users for multi-session testing
