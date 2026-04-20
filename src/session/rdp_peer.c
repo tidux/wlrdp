@@ -854,6 +854,91 @@ static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
     return true;
 }
 
+static bool send_gfx_avc444(struct wlrdp_peer_context *ctx,
+                             uint8_t *main_data, uint32_t main_len,
+                             uint8_t *aux_data, uint32_t aux_len,
+                             uint32_t width, uint32_t height,
+                             bool is_avc444v2)
+{
+    RdpgfxServerContext *gfx = ctx->gfx_context;
+
+    RECTANGLE_16 region_rect = {
+        .left = 0, .top = 0,
+        .right = (UINT16)width, .bottom = (UINT16)height,
+    };
+
+    RDPGFX_H264_QUANT_QUALITY quant_qual = {
+        .qp = 22,
+        .qualityVal = 100,
+        .qpVal = 22,
+    };
+
+    /* LC byte: bit 0 = luma (main) present, bit 1 = chroma (aux) present */
+    BYTE lc = 0;
+    if (main_len > 0) lc |= 0x01;
+    if (aux_len > 0)  lc |= 0x02;
+
+    RDPGFX_AVC444_BITMAP_STREAM avc444 = {
+        .cbAvc420EncodedBitstream1 = main_len,
+        .LC = lc,
+        .bitstream = {
+            [0] = {
+                .meta = {
+                    .numRegionRects = 1,
+                    .regionRects = &region_rect,
+                    .quantQualityVals = &quant_qual,
+                },
+                .length = main_len,
+                .data = main_data,
+            },
+            [1] = {
+                .meta = {
+                    .numRegionRects = 1,
+                    .regionRects = &region_rect,
+                    .quantQualityVals = &quant_qual,
+                },
+                .length = aux_len,
+                .data = aux_data,
+            },
+        },
+    };
+
+    ctx->gfx_frame_id++;
+
+    RDPGFX_START_FRAME_PDU start = { .frameId = ctx->gfx_frame_id };
+    if (gfx->StartFrame(gfx, &start) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX StartFrame failed");
+        return false;
+    }
+
+    RDPGFX_SURFACE_COMMAND cmd = {
+        .surfaceId = ctx->gfx_surface_id,
+        .codecId = is_avc444v2 ? RDPGFX_CODECID_AVC444v2
+                               : RDPGFX_CODECID_AVC444,
+        .format = PIXEL_FORMAT_BGRX32,
+        .left = 0,
+        .top = 0,
+        .right = width,
+        .bottom = height,
+        .length = main_len + aux_len,
+        .data = main_data,
+        .extra = &avc444,
+    };
+
+    if (gfx->SurfaceCommand(gfx, &cmd) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX SurfaceCommand (AVC444) failed");
+        return false;
+    }
+
+    RDPGFX_END_FRAME_PDU end = { .frameId = ctx->gfx_frame_id };
+    if (gfx->EndFrame(gfx, &end) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX EndFrame failed");
+        return false;
+    }
+
+    return true;
+}
+
 static bool send_surface_bits(freerdp_peer *client,
                                uint8_t *data, uint32_t len,
                                uint32_t width, uint32_t height)
@@ -884,6 +969,7 @@ static bool send_surface_bits(freerdp_peer *client,
 
 bool rdp_peer_send_frame(freerdp_peer *client,
                          uint8_t *data, uint32_t len,
+                         uint8_t *aux_data, uint32_t aux_len,
                          uint32_t width, uint32_t height,
                          bool is_keyframe)
 {
@@ -892,8 +978,19 @@ bool rdp_peer_send_frame(freerdp_peer *client,
 
     (void)is_keyframe; /* AVC420 metadata carries QP, not per-frame keyframe flag */
 
-    if (ctx->send_mode == WLRDP_SEND_GFX_AVC420 && ctx->gfx_ready) {
-        return send_gfx_avc420(ctx, data, len, width, height);
+    if (ctx->gfx_ready) {
+        switch (ctx->send_mode) {
+        case WLRDP_SEND_GFX_AVC444V2:
+            return send_gfx_avc444(ctx, data, len, aux_data, aux_len,
+                                   width, height, true);
+        case WLRDP_SEND_GFX_AVC444:
+            return send_gfx_avc444(ctx, data, len, aux_data, aux_len,
+                                   width, height, false);
+        case WLRDP_SEND_GFX_AVC420:
+            return send_gfx_avc420(ctx, data, len, width, height);
+        default:
+            break;
+        }
     }
 
     return send_surface_bits(client, data, len, width, height);

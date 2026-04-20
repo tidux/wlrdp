@@ -63,12 +63,14 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
 
 /*
  * Send a frame to the RDP client.
- * For GFX mode: data is H.264 NAL units, len is byte count.
- * For SurfaceBits mode: data is raw BGRX pixels, len is byte count.
- * is_keyframe is only meaningful for GFX mode.
+ * For AVC420/SurfaceBits: data is the main stream (H.264 or BGRX), aux_data ignored.
+ * For AVC444/AVC444v2: data is the main (base) H.264 stream; aux_data/aux_len
+ *   is the chroma refinement stream (may be zero-length if encoder is buffering).
+ * is_keyframe is only meaningful for GFX modes.
  */
 bool rdp_peer_send_frame(freerdp_peer *client,
                          uint8_t *data, uint32_t len,
+                         uint8_t *aux_data, uint32_t aux_len,
                          uint32_t width, uint32_t height,
                          bool is_keyframe);
 
