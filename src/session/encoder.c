@@ -182,6 +182,13 @@ static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name,
         av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
         av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
         av_opt_set(ctx->priv_data, "profile", "baseline", 0);
+        /* Match RDPGFX quant (QP=22), force full-range YUV (avoids color shift in AVC444
+         * combine/decode), disable lookahead for lowest latency. Aux stream benefits from
+         * same tuning as main (chroma refinement is still YUV420P). */
+        av_opt_set(ctx->priv_data, "qp", "22", 0);
+        av_opt_set(ctx->priv_data, "crf", "22", 0);
+        av_opt_set(ctx->priv_data, "color_range", "full", 0);
+        av_opt_set(ctx->priv_data, "rc-lookahead", "0", 0);
     } else if (strcmp(name, "h264_nvenc") == 0) {
         av_opt_set(ctx->priv_data, "preset", "p1", 0); /* p1 = fastest */
         av_opt_set(ctx->priv_data, "tune", "ull", 0);  /* ull = ultra low latency */
@@ -435,9 +442,23 @@ static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
     uint32_t w = enc->width & ~1;
     uint32_t h = enc->height & ~1;
 
+    enc->frame_count++;
+    bool force_keyframe = (enc->frame_count <= 5); /* Force IDR/SPS/PPS for first frames (fixes init/decode; flashes on mouse move indicate stale first frames) */
+
     prim_size_t roi = { .width = w, .height = h };
     UINT32 main_step[3] = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
     UINT32 aux_step[3]  = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
+
+    /* Zero YUV buffers on early frames to ensure clean init (primitive should overwrite, but this eliminates any stale data causing color/init errors). */
+    if (force_keyframe) {
+        for (int i = 0; i < 3; i++) {
+            uint32_t plane_h = (i == 0) ? h : h / 2;
+            size_t plane_size = (size_t)enc->yuv_stride[i] * plane_h;
+            memset(enc->yuv_main[i], 0, plane_size);
+            memset(enc->yuv_aux[i], 0, plane_size);
+        }
+        encoder_request_keyframe(enc); /* Force IDR/SPS/PPS on early frames (addresses init error; mouse-move flashes indicate first frames were ignored by decoder) */
+    }
 
     /* Split BGRX into main (base YUV420) + aux (chroma refinement YUV420) */
     /* Note: capture uses XRGB8888 (0xXXRRGGBB); on LE this is B,G,R,X in memory, which matches PIXEL_FORMAT_BGRX32. */
@@ -469,7 +490,11 @@ static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
             return false;
         }
 
-        /* Copy each plane (Y, U, V) row by row */
+        /* Copy each plane (Y, U, V) row by row. Zero padding to prevent
+         * garbage bytes from being encoded (AVFrame linesize includes
+         * alignment padding; primitive uses tight strides). This fixes
+         * color artifacts, decode failures (black screen on MS RDP), and
+         * related rendering issues. */
         for (int p = 0; p < 3; p++) {
             uint32_t plane_h = (p == 0) ? h : h / 2;
             uint32_t src_stride = enc->yuv_stride[p];
@@ -477,9 +502,12 @@ static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
             uint32_t copy_width = (p == 0) ? w : w / 2;
 
             for (uint32_t row = 0; row < plane_h; row++) {
-                memcpy(frame->data[p] + row * dst_stride,
-                       yuv[p] + row * src_stride,
-                       copy_width);
+                uint8_t *dst = frame->data[p] + row * (size_t)dst_stride;
+                uint8_t *src = yuv[p] + row * (size_t)src_stride;
+                memcpy(dst, src, copy_width);
+                if (dst_stride > copy_width) {
+                    memset(dst + copy_width, 0, dst_stride - copy_width);
+                }
             }
         }
     }
@@ -513,6 +541,7 @@ bool encoder_init(struct wlrdp_encoder *enc, enum wlrdp_encoder_mode mode,
     enc->width = width;
     enc->height = height;
     enc->format = format;
+    enc->frame_count = 0;
     if (mode == WLRDP_ENCODER_AVC444) {
         enc->avc444v2 = avc444v2;
     }

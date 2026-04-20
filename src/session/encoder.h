@@ -51,6 +51,7 @@ struct wlrdp_encoder {
     uint8_t *aux_buf;       /* aux stream (AVC444 chroma, NULL for AVC420/NSC) */
     uint32_t aux_len;
     bool is_keyframe;
+    uint32_t frame_count;   /* Tracks initial frames for forced keyframes (fixes init/decode issues) */
 };
 
 /*

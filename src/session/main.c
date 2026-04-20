@@ -116,6 +116,8 @@ static void init_encoder_for_client(struct wlrdp_server *srv)
         return;
     }
 
+    encoder_request_keyframe(&srv->encoder); /* Ensure first frame is IDR (helps initial render/prompt) */
+
     srv->encoder_initialized = true;
 
     const char *mode_str;
