@@ -81,7 +81,8 @@ static void nsc_cleanup(struct wlrdp_encoder *enc)
 
 #ifdef WLRDP_HAVE_H264
 
-static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name)
+static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name,
+                             struct h264_ctx *hctx)
 {
     const AVCodec *codec = avcodec_find_encoder_by_name(name);
     if (!codec) {
@@ -171,14 +172,13 @@ static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name)
         return false;
     }
 
-    enc->av_codec_ctx = ctx;
-    enc->av_frame = frame;
-    enc->av_packet = pkt;
-    enc->sws_ctx = sws;
-    enc->mode = WLRDP_ENCODER_H264;
+    hctx->codec_ctx = ctx;
+    hctx->frame = frame;
+    hctx->packet = pkt;
+    hctx->sws_ctx = sws;
 
-    WLRDP_LOG_INFO("encoder initialized (%ux%u, aligned to %ux%u, H.264 via %s)",
-                    enc->width, enc->height, ctx->width, ctx->height, name);
+    WLRDP_LOG_INFO("H.264 encoder '%s' opened (%ux%u -> %ux%u)",
+                    name, enc->width, enc->height, ctx->width, ctx->height);
     return true;
 }
 
@@ -193,7 +193,10 @@ static bool h264_init(struct wlrdp_encoder *enc)
     };
 
     for (int i = 0; encoders[i]; i++) {
-        if (h264_try_encoder(enc, encoders[i])) {
+        if (h264_try_encoder(enc, encoders[i], &enc->h264[0])) {
+            enc->mode = WLRDP_ENCODER_H264;
+            WLRDP_LOG_INFO("encoder initialized (%ux%u, H.264 via %s)",
+                            enc->width, enc->height, encoders[i]);
             return true;
         }
     }
@@ -205,10 +208,11 @@ static bool h264_init(struct wlrdp_encoder *enc)
 static bool h264_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
                         uint32_t stride)
 {
-    AVCodecContext *ctx = enc->av_codec_ctx;
-    AVFrame *frame = enc->av_frame;
-    AVPacket *pkt = enc->av_packet;
-    struct SwsContext *sws = enc->sws_ctx;
+    struct h264_ctx *hctx = &enc->h264[0];
+    AVCodecContext *ctx = hctx->codec_ctx;
+    AVFrame *frame = hctx->frame;
+    AVPacket *pkt = hctx->packet;
+    struct SwsContext *sws = hctx->sws_ctx;
 
     /* Convert BGRX -> YUV420P */
     const uint8_t *src_data[1] = { pixels };
@@ -248,21 +252,39 @@ static bool h264_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
     return true;
 }
 
+static void h264_ctx_cleanup(struct h264_ctx *hctx)
+{
+    if (hctx->sws_ctx) {
+        sws_freeContext(hctx->sws_ctx);
+        hctx->sws_ctx = NULL;
+    }
+    if (hctx->packet) {
+        av_packet_free((AVPacket **)&hctx->packet);
+    }
+    if (hctx->frame) {
+        av_frame_free((AVFrame **)&hctx->frame);
+    }
+    if (hctx->codec_ctx) {
+        avcodec_free_context((AVCodecContext **)&hctx->codec_ctx);
+    }
+}
+
 static void h264_cleanup(struct wlrdp_encoder *enc)
 {
-    if (enc->sws_ctx) {
-        sws_freeContext(enc->sws_ctx);
-        enc->sws_ctx = NULL;
-    }
-    if (enc->av_packet) {
-        av_packet_free((AVPacket **)&enc->av_packet);
-    }
-    if (enc->av_frame) {
-        av_frame_free((AVFrame **)&enc->av_frame);
-    }
-    if (enc->av_codec_ctx) {
-        avcodec_free_context((AVCodecContext **)&enc->av_codec_ctx);
-    }
+    h264_ctx_cleanup(&enc->h264[0]);
+    h264_ctx_cleanup(&enc->h264[1]);
+}
+
+/* AVC444 stubs — replaced with real implementations in Task 2 */
+static bool avc444_init(struct wlrdp_encoder *enc)
+{
+    (void)enc;
+    return false;
+}
+
+static void avc444_cleanup_buffers(struct wlrdp_encoder *enc)
+{
+    (void)enc;
 }
 
 #endif /* WLRDP_HAVE_H264 */
@@ -277,14 +299,20 @@ bool encoder_init(struct wlrdp_encoder *enc, enum wlrdp_encoder_mode mode,
     enc->height = height;
 
 #ifdef WLRDP_HAVE_H264
+    if (mode == WLRDP_ENCODER_AVC444) {
+        if (avc444_init(enc)) {
+            return true;
+        }
+        /* AVC444 failed — try plain AVC420 before NSCodec */
+        mode = WLRDP_ENCODER_H264;
+    }
     if (mode == WLRDP_ENCODER_H264) {
         if (h264_init(enc)) {
             return true;
         }
-        /* Fall through to NSCodec */
     }
 #else
-    if (mode == WLRDP_ENCODER_H264) {
+    if (mode == WLRDP_ENCODER_H264 || mode == WLRDP_ENCODER_AVC444) {
         WLRDP_LOG_WARN("H.264 not compiled in, falling back to NSCodec");
     }
 #endif
@@ -296,6 +324,10 @@ bool encoder_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
                     uint32_t stride)
 {
 #ifdef WLRDP_HAVE_H264
+    if (enc->mode == WLRDP_ENCODER_AVC444) {
+        /* Replaced with avc444_encode in Task 3 */
+        return false;
+    }
     if (enc->mode == WLRDP_ENCODER_H264) {
         return h264_encode(enc, pixels, stride);
     }
@@ -306,8 +338,12 @@ bool encoder_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
 void encoder_request_keyframe(struct wlrdp_encoder *enc)
 {
 #ifdef WLRDP_HAVE_H264
-    if (enc->mode == WLRDP_ENCODER_H264 && enc->av_frame) {
-        ((AVFrame *)enc->av_frame)->pict_type = AV_PICTURE_TYPE_I;
+    if ((enc->mode == WLRDP_ENCODER_H264 || enc->mode == WLRDP_ENCODER_AVC444)
+        && enc->h264[0].frame) {
+        ((AVFrame *)enc->h264[0].frame)->pict_type = AV_PICTURE_TYPE_I;
+    }
+    if (enc->mode == WLRDP_ENCODER_AVC444 && enc->h264[1].frame) {
+        ((AVFrame *)enc->h264[1].frame)->pict_type = AV_PICTURE_TYPE_I;
     }
 #else
     (void)enc;
@@ -318,6 +354,7 @@ void encoder_destroy(struct wlrdp_encoder *enc)
 {
 #ifdef WLRDP_HAVE_H264
     h264_cleanup(enc);
+    avc444_cleanup_buffers(enc);
 #endif
     nsc_cleanup(enc);
     memset(enc, 0, sizeof(*enc));

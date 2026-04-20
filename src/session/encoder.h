@@ -6,7 +6,19 @@
 
 enum wlrdp_encoder_mode {
     WLRDP_ENCODER_NSC,     /* NSCodec fallback (Phase 1 behavior) */
-    WLRDP_ENCODER_H264,    /* H.264 via FFmpeg */
+    WLRDP_ENCODER_H264,    /* H.264 via FFmpeg (AVC420) */
+    WLRDP_ENCODER_AVC444,  /* H.264 AVC444/AVC444v2 dual-stream */
+};
+
+/*
+ * Single H.264 encoder context (codec + frame + packet + color converter).
+ * AVC420 uses one of these; AVC444 uses two (main + aux).
+ */
+struct h264_ctx {
+    void *codec_ctx;    /* AVCodecContext* */
+    void *frame;        /* AVFrame* (YUV420P) */
+    void *packet;       /* AVPacket* */
+    void *sws_ctx;      /* SwsContext* for pixel format conversion */
 };
 
 struct wlrdp_encoder {
@@ -18,15 +30,20 @@ struct wlrdp_encoder {
     void *nsc_ctx;
     void *nsc_stream;
 
-    /* H.264 state (used when mode == WLRDP_ENCODER_H264) */
-    void *av_codec_ctx;    /* AVCodecContext* */
-    void *av_frame;        /* AVFrame* (NV12 or YUV420P) */
-    void *av_packet;       /* AVPacket* */
-    void *sws_ctx;         /* SwsContext* for BGRX->YUV conversion */
+    /* H.264 state: h264[0] = main stream, h264[1] = aux/chroma (AVC444 only) */
+    struct h264_ctx h264[2];
+
+    /* AVC444 intermediate YUV plane buffers (allocated by avc444_init) */
+    uint8_t *yuv_main[3];   /* main YUV420 planes (Y, U, V) */
+    uint8_t *yuv_aux[3];    /* aux YUV420 planes (Y, U, V) */
+    uint32_t yuv_stride[3]; /* plane strides */
+    bool avc444v2;          /* true = use AVC444v2 chroma layout */
 
     /* Output — valid after encoder_encode until next call or destroy */
-    uint8_t *out_buf;
+    uint8_t *out_buf;       /* main stream (AVC420 or AVC444 base) */
     uint32_t out_len;
+    uint8_t *aux_buf;       /* aux stream (AVC444 chroma, NULL for AVC420/NSC) */
+    uint32_t aux_len;
     bool is_keyframe;
 };
 
