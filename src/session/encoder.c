@@ -206,13 +206,48 @@ static bool h264_init(struct wlrdp_encoder *enc)
     return false;
 }
 
+/*
+ * Encode a frame using a single H.264 context. The caller must have already
+ * filled hctx->frame->data with YUV420P planes. Sets *out and *out_len to
+ * the encoded NAL units. Returns true on success.
+ */
+static bool h264_ctx_encode(struct h264_ctx *hctx, int64_t pts,
+                            uint8_t **out, uint32_t *out_len, bool *keyframe)
+{
+    AVCodecContext *ctx = hctx->codec_ctx;
+    AVFrame *frame = hctx->frame;
+    AVPacket *pkt = hctx->packet;
+
+    frame->pts = pts;
+
+    int ret = avcodec_send_frame(ctx, frame);
+    if (ret < 0) {
+        WLRDP_LOG_ERROR("avcodec_send_frame failed: %d", ret);
+        return false;
+    }
+
+    ret = avcodec_receive_packet(ctx, pkt);
+    if (ret == AVERROR(EAGAIN)) {
+        *out_len = 0;
+        return true;
+    }
+    if (ret < 0) {
+        WLRDP_LOG_ERROR("avcodec_receive_packet failed: %d", ret);
+        return false;
+    }
+
+    *out = pkt->data;
+    *out_len = pkt->size;
+    *keyframe = !!(pkt->flags & AV_PKT_FLAG_KEY);
+    return true;
+}
+
 static bool h264_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
                         uint32_t stride)
 {
     struct h264_ctx *hctx = &enc->h264[0];
     AVCodecContext *ctx = hctx->codec_ctx;
     AVFrame *frame = hctx->frame;
-    AVPacket *pkt = hctx->packet;
     struct SwsContext *sws = hctx->sws_ctx;
 
     /* Convert BGRX -> YUV420P */
@@ -227,30 +262,8 @@ static bool h264_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
     sws_scale(sws, src_data, src_linesize, 0, enc->height,
               frame->data, frame->linesize);
 
-    frame->pts = ctx->frame_num;
-
-    int ret = avcodec_send_frame(ctx, frame);
-    if (ret < 0) {
-        WLRDP_LOG_ERROR("avcodec_send_frame failed: %d", ret);
-        return false;
-    }
-
-    ret = avcodec_receive_packet(ctx, pkt);
-    if (ret == AVERROR(EAGAIN)) {
-        /* Encoder needs more frames — shouldn't happen with zerolatency */
-        enc->out_len = 0;
-        return true;
-    }
-    if (ret < 0) {
-        WLRDP_LOG_ERROR("avcodec_receive_packet failed: %d", ret);
-        return false;
-    }
-
-    enc->out_buf = pkt->data;
-    enc->out_len = pkt->size;
-    enc->is_keyframe = !!(pkt->flags & AV_PKT_FLAG_KEY);
-
-    return true;
+    return h264_ctx_encode(hctx, ctx->frame_num,
+                           &enc->out_buf, &enc->out_len, &enc->is_keyframe);
 }
 
 static void h264_ctx_cleanup(struct h264_ctx *hctx)
@@ -352,6 +365,79 @@ static bool avc444_init(struct wlrdp_encoder *enc)
     return true;
 }
 
+static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
+                          uint32_t stride)
+{
+    primitives_t *prims = primitives_get();
+    uint32_t w = enc->width & ~1;
+    uint32_t h = enc->height & ~1;
+
+    prim_size_t roi = { .width = w, .height = h };
+    UINT32 main_step[3] = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
+    UINT32 aux_step[3]  = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
+
+    /* Split BGRX into main (base YUV420) + aux (chroma refinement YUV420) */
+    pstatus_t prc;
+    if (enc->avc444v2) {
+        prc = prims->RGBToAVC444YUVv2(pixels, PIXEL_FORMAT_BGRX32, stride,
+                                       enc->yuv_main, main_step,
+                                       enc->yuv_aux, aux_step, &roi);
+    } else {
+        prc = prims->RGBToAVC444YUV(pixels, PIXEL_FORMAT_BGRX32, stride,
+                                     enc->yuv_main, main_step,
+                                     enc->yuv_aux, aux_step, &roi);
+    }
+
+    if (prc != PRIMITIVES_SUCCESS) {
+        WLRDP_LOG_ERROR("RGBToAVC444YUV%s failed: %d",
+                        enc->avc444v2 ? "v2" : "", (int)prc);
+        return false;
+    }
+
+    /* Copy YUV planes into encoder frames */
+    for (int stream = 0; stream < 2; stream++) {
+        struct h264_ctx *hctx = &enc->h264[stream];
+        AVFrame *frame = hctx->frame;
+        uint8_t **yuv = (stream == 0) ? enc->yuv_main : enc->yuv_aux;
+
+        if (av_frame_make_writable(frame) < 0) {
+            WLRDP_LOG_ERROR("av_frame_make_writable failed (stream %d)", stream);
+            return false;
+        }
+
+        /* Copy each plane (Y, U, V) row by row */
+        for (int p = 0; p < 3; p++) {
+            uint32_t plane_h = (p == 0) ? h : h / 2;
+            uint32_t src_stride = enc->yuv_stride[p];
+            uint32_t dst_stride = frame->linesize[p];
+            uint32_t copy_width = (p == 0) ? w : w / 2;
+
+            for (uint32_t row = 0; row < plane_h; row++) {
+                memcpy(frame->data[p] + row * dst_stride,
+                       yuv[p] + row * src_stride,
+                       copy_width);
+            }
+        }
+    }
+
+    /* Encode main stream */
+    AVCodecContext *main_ctx = enc->h264[0].codec_ctx;
+    if (!h264_ctx_encode(&enc->h264[0], main_ctx->frame_num,
+                         &enc->out_buf, &enc->out_len, &enc->is_keyframe)) {
+        return false;
+    }
+
+    /* Encode aux stream */
+    AVCodecContext *aux_ctx = enc->h264[1].codec_ctx;
+    bool aux_key;
+    if (!h264_ctx_encode(&enc->h264[1], aux_ctx->frame_num,
+                         &enc->aux_buf, &enc->aux_len, &aux_key)) {
+        return false;
+    }
+
+    return true;
+}
+
 #endif /* WLRDP_HAVE_H264 */
 
 /* --- Public API --- */
@@ -390,8 +476,7 @@ bool encoder_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
 {
 #ifdef WLRDP_HAVE_H264
     if (enc->mode == WLRDP_ENCODER_AVC444) {
-        /* Replaced with avc444_encode in Task 3 */
-        return false;
+        return avc444_encode(enc, pixels, stride);
     }
     if (enc->mode == WLRDP_ENCODER_H264) {
         return h264_encode(enc, pixels, stride);
