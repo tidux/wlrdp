@@ -13,6 +13,49 @@
 #include <freerdp/primitives.h>
 #endif
 
+/* --- RAW helpers --- */
+
+static bool raw_init(struct wlrdp_encoder *enc)
+{
+    enc->mode = WLRDP_ENCODER_RAW;
+    WLRDP_LOG_INFO("encoder initialized (%ux%u, RAW)", enc->width, enc->height);
+    return true;
+}
+
+static bool raw_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
+                       uint32_t stride)
+{
+    uint32_t bpp = FreeRDPGetBitsPerPixel(enc->format);
+    uint32_t dst_stride = (enc->width * bpp + 7) / 8;
+    uint32_t needed = dst_stride * enc->height;
+
+    if (enc->conv_size < needed) {
+        enc->conv_buf = realloc(enc->conv_buf, needed);
+        enc->conv_size = needed;
+    }
+
+    /* Screencopy is top-down, SurfaceBits/NSCodec expects bottom-up.
+     * Always flip in RAW and NSC modes. */
+    if (!freerdp_image_copy(enc->conv_buf, enc->format, dst_stride, 0, 0,
+                             enc->width, enc->height, pixels, PIXEL_FORMAT_BGRX32,
+                             stride, 0, 0, NULL, FREERDP_FLIP_VERTICAL)) {
+        WLRDP_LOG_ERROR("freerdp_image_copy failed for raw conversion+flip to 0x%x", enc->format);
+        return false;
+    }
+
+    enc->out_buf = enc->conv_buf;
+    enc->out_len = needed;
+    enc->is_keyframe = true;
+    return true;
+}
+
+static void raw_cleanup(struct wlrdp_encoder *enc)
+{
+    free(enc->conv_buf);
+    enc->conv_buf = NULL;
+    enc->conv_size = 0;
+}
+
 /* --- NSCodec helpers --- */
 
 static bool nsc_init(struct wlrdp_encoder *enc)
@@ -27,8 +70,8 @@ static bool nsc_init(struct wlrdp_encoder *enc)
     nsc_context_set_parameters(nsc, NSC_ALLOW_SUBSAMPLING, 1);
     nsc_context_set_parameters(nsc, NSC_DYNAMIC_COLOR_FIDELITY, 1);
 
-    if (!nsc_context_set_parameters(nsc, NSC_COLOR_FORMAT, PIXEL_FORMAT_BGRX32)) {
-        WLRDP_LOG_ERROR("failed to set NSCodec pixel format");
+    if (!nsc_context_set_parameters(nsc, NSC_COLOR_FORMAT, enc->format)) {
+        WLRDP_LOG_ERROR("failed to set NSCodec pixel format 0x%08x", enc->format);
         nsc_context_free(nsc);
         return false;
     }
@@ -53,9 +96,26 @@ static bool nsc_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
     NSC_CONTEXT *nsc = enc->nsc_ctx;
     wStream *s = enc->nsc_stream;
 
+    uint32_t bpp = FreeRDPGetBitsPerPixel(enc->format);
+    uint32_t dst_stride = (enc->width * bpp + 7) / 8;
+    uint32_t needed = dst_stride * enc->height;
+
+    if (enc->conv_size < needed) {
+        enc->conv_buf = realloc(enc->conv_buf, needed);
+        enc->conv_size = needed;
+    }
+
+    /* Flip vertically: screencopy top-down -> NSCodec bottom-up */
+    if (!freerdp_image_copy(enc->conv_buf, enc->format, dst_stride, 0, 0,
+                             enc->width, enc->height, pixels, PIXEL_FORMAT_BGRX32,
+                             stride, 0, 0, NULL, FREERDP_FLIP_VERTICAL)) {
+        WLRDP_LOG_ERROR("freerdp_image_copy failed for nsc conversion+flip to 0x%x", enc->format);
+        return false;
+    }
+
     Stream_SetPosition(s, 0);
 
-    if (!nsc_compose_message(nsc, s, pixels, enc->width, enc->height, stride)) {
+    if (!nsc_compose_message(nsc, s, enc->conv_buf, enc->width, enc->height, dst_stride)) {
         WLRDP_LOG_ERROR("nsc_compose_message failed");
         return false;
     }
@@ -76,6 +136,9 @@ static void nsc_cleanup(struct wlrdp_encoder *enc)
         nsc_context_free(enc->nsc_ctx);
         enc->nsc_ctx = NULL;
     }
+    free(enc->conv_buf);
+    enc->conv_buf = NULL;
+    enc->conv_size = 0;
 }
 
 /* --- H.264 helpers --- */
@@ -301,11 +364,11 @@ static void avc444_cleanup_buffers(struct wlrdp_encoder *enc)
 
 static bool avc444_init(struct wlrdp_encoder *enc)
 {
-    /* Both streams use the same H.264 encoder.
-     * Find a working encoder name first, then open two instances. */
+    /* Software encoder only for AVC444. Hardware encoders (vaapi/nvenc)
+     * are not suitable for the dual YUV420 streams produced by
+     * FreeRDP's RGBToAVC444YUV primitive (no hardware frame support,
+     * incompatible with chroma refinement data). */
     static const char *encoders[] = {
-        "h264_vaapi",
-        "h264_nvenc",
         "libx264",
         NULL,
     };
@@ -377,6 +440,7 @@ static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
     UINT32 aux_step[3]  = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
 
     /* Split BGRX into main (base YUV420) + aux (chroma refinement YUV420) */
+    /* Note: capture uses XRGB8888 (0xXXRRGGBB); on LE this is B,G,R,X in memory, which matches PIXEL_FORMAT_BGRX32. */
     pstatus_t prc;
     if (enc->avc444v2) {
         prc = prims->RGBToAVC444YUVv2(pixels, PIXEL_FORMAT_BGRX32, stride,
@@ -443,11 +507,15 @@ static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
 /* --- Public API --- */
 
 bool encoder_init(struct wlrdp_encoder *enc, enum wlrdp_encoder_mode mode,
-                  uint32_t width, uint32_t height)
+                  uint32_t width, uint32_t height, bool avc444v2, uint32_t format)
 {
     memset(enc, 0, sizeof(*enc));
     enc->width = width;
     enc->height = height;
+    enc->format = format;
+    if (mode == WLRDP_ENCODER_AVC444) {
+        enc->avc444v2 = avc444v2;
+    }
 
 #ifdef WLRDP_HAVE_H264
     if (mode == WLRDP_ENCODER_AVC444) {
@@ -464,11 +532,17 @@ bool encoder_init(struct wlrdp_encoder *enc, enum wlrdp_encoder_mode mode,
     }
 #else
     if (mode == WLRDP_ENCODER_H264 || mode == WLRDP_ENCODER_AVC444) {
-        WLRDP_LOG_WARN("H.264 not compiled in, falling back to NSCodec");
+        WLRDP_LOG_WARN("H.264 not compiled in, falling back to NSCodec or RAW");
     }
 #endif
 
-    return nsc_init(enc);
+    if (mode == WLRDP_ENCODER_NSC) {
+        if (nsc_init(enc)) {
+            return true;
+        }
+    }
+
+    return raw_init(enc);
 }
 
 bool encoder_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
@@ -482,7 +556,10 @@ bool encoder_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
         return h264_encode(enc, pixels, stride);
     }
 #endif
-    return nsc_encode(enc, pixels, stride);
+    if (enc->mode == WLRDP_ENCODER_NSC) {
+        return nsc_encode(enc, pixels, stride);
+    }
+    return raw_encode(enc, pixels, stride);
 }
 
 void encoder_request_keyframe(struct wlrdp_encoder *enc)
@@ -507,5 +584,6 @@ void encoder_destroy(struct wlrdp_encoder *enc)
     avc444_cleanup_buffers(enc);
 #endif
     nsc_cleanup(enc);
+    raw_cleanup(enc);
     memset(enc, 0, sizeof(*enc));
 }

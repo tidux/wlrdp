@@ -586,6 +586,15 @@ static BOOL on_post_connect(freerdp_peer *client)
         freerdp_settings_get_bool(settings, FreeRDP_SurfaceCommandsEnabled),
         freerdp_settings_get_bool(settings, FreeRDP_GfxH264));
 
+    uint32_t depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
+    switch (depth) {
+    case 32: ctx->pixel_format = PIXEL_FORMAT_BGRX32; break;
+    case 24: ctx->pixel_format = PIXEL_FORMAT_BGR24; break;
+    case 16: ctx->pixel_format = PIXEL_FORMAT_RGB16; break;
+    default: ctx->pixel_format = PIXEL_FORMAT_BGRX32; break;
+    }
+    WLRDP_LOG_INFO("negotiated pixel format: 0x%08x (%u bpp)", ctx->pixel_format, depth);
+
     /* Start VCM + DRDYNVC handshake — GFX opens later via rdp_peer_check_vcm */
     if (freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline)) {
         vcm_init(ctx);
@@ -667,7 +676,6 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE);
 
     freerdp_settings_set_bool(settings, FreeRDP_SurfaceCommandsEnabled, TRUE);
-    freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
     /* Enable NSCodec for SurfaceBits fallback path */
     freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
@@ -830,7 +838,7 @@ static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
     RDPGFX_SURFACE_COMMAND cmd = {
         .surfaceId = ctx->gfx_surface_id,
         .codecId = RDPGFX_CODECID_AVC420,
-        .format = PIXEL_FORMAT_BGRX32,
+        .format = ctx->pixel_format,
         .left = 0,
         .top = 0,
         .right = width,
@@ -873,13 +881,18 @@ static bool send_gfx_avc444(struct wlrdp_peer_context *ctx,
         .qpVal = 22,
     };
 
-    /* LC byte: bit 0 = luma (main) present, bit 1 = chroma (aux) present */
-    BYTE lc = 0;
-    if (main_len > 0) lc |= 0x01;
-    if (aux_len > 0)  lc |= 0x02;
+    /* LC per MS-RDPEGFX: 0 = both luma+chroma streams, 1 = luma only, 2 = chroma only */
+    BYTE lc;
+    if (main_len > 0 && aux_len > 0) lc = 0;
+    else if (main_len > 0)           lc = 1;
+    else                             lc = 2;
+
+    /* cbAvc420EncodedBitstream1 = metablock1 bytes + H.264 stream 1 bytes.
+     * Metablock size = 4 (numRegionRects) + numRegionRects * (8 rect + 2 qp/qual). */
+    const uint32_t metablock1_size = 4 + 1 * 10;
 
     RDPGFX_AVC444_BITMAP_STREAM avc444 = {
-        .cbAvc420EncodedBitstream1 = main_len,
+        .cbAvc420EncodedBitstream1 = metablock1_size + main_len,
         .LC = lc,
         .bitstream = {
             [0] = {
@@ -915,7 +928,7 @@ static bool send_gfx_avc444(struct wlrdp_peer_context *ctx,
         .surfaceId = ctx->gfx_surface_id,
         .codecId = is_avc444v2 ? RDPGFX_CODECID_AVC444v2
                                : RDPGFX_CODECID_AVC444,
-        .format = PIXEL_FORMAT_BGRX32,
+        .format = ctx->pixel_format,
         .left = 0,
         .top = 0,
         .right = width,
@@ -945,6 +958,7 @@ static bool send_surface_bits(freerdp_peer *client,
 {
     rdpUpdate *update = client->context->update;
     rdpSettings *settings = client->context->settings;
+    struct wlrdp_peer_context *ctx = (struct wlrdp_peer_context *)client->context;
 
     SURFACE_BITS_COMMAND cmd = { 0 };
     cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
@@ -952,10 +966,16 @@ static bool send_surface_bits(freerdp_peer *client,
     cmd.destTop = 0;
     cmd.destRight = width;
     cmd.destBottom = height;
-    cmd.bmp.bpp = 32;
+    cmd.bmp.bpp = FreeRDPGetBitsPerPixel(ctx->pixel_format);
     cmd.bmp.width = width;
     cmd.bmp.height = height;
-    cmd.bmp.codecID = freerdp_settings_get_uint32(settings, FreeRDP_NSCodecId);
+
+    if (freerdp_settings_get_bool(settings, FreeRDP_NSCodec)) {
+        cmd.bmp.codecID = RDP_CODEC_ID_NSCODEC;
+    } else {
+        cmd.bmp.codecID = RDP_CODEC_ID_NONE;
+    }
+
     cmd.bmp.bitmapDataLength = len;
     cmd.bmp.bitmapData = data;
 

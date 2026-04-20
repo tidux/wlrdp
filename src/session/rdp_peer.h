@@ -56,6 +56,7 @@ struct wlrdp_peer_context {
     struct wlrdp_audio *audio; /* set by main.c before activation */
 
     enum wlrdp_send_mode send_mode;
+    uint32_t pixel_format;
 };
 
 bool rdp_peer_init(freerdp_peer *client, const char *cert_file,

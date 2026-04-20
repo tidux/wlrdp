@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 enum wlrdp_encoder_mode {
+    WLRDP_ENCODER_RAW,     /* Raw pixels (nocodec) */
     WLRDP_ENCODER_NSC,     /* NSCodec fallback (Phase 1 behavior) */
     WLRDP_ENCODER_H264,    /* H.264 via FFmpeg (AVC420) */
     WLRDP_ENCODER_AVC444,  /* H.264 AVC444/AVC444v2 dual-stream */
@@ -38,6 +39,11 @@ struct wlrdp_encoder {
     uint8_t *yuv_aux[3];    /* aux YUV420 planes (Y, U, V) */
     uint32_t yuv_stride[3]; /* plane strides */
     bool avc444v2;          /* true = use AVC444v2 chroma layout */
+    uint32_t format;        /* RDP pixel format (PIXEL_FORMAT_XXX) */
+
+    /* Conversion buffer for non-32bit formats */
+    uint8_t *conv_buf;
+    uint32_t conv_size;
 
     /* Output — valid after encoder_encode until next call or destroy */
     uint8_t *out_buf;       /* main stream (AVC420 or AVC444 base) */
@@ -53,7 +59,7 @@ struct wlrdp_encoder {
  * Returns true on success. After init, check enc->mode for actual mode.
  */
 bool encoder_init(struct wlrdp_encoder *enc, enum wlrdp_encoder_mode mode,
-                  uint32_t width, uint32_t height);
+                  uint32_t width, uint32_t height, bool avc444v2, uint32_t format);
 
 /*
  * Encode a frame of XRGB8888 pixels.
