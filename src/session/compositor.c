@@ -82,7 +82,8 @@ bool compositor_launch(struct wlrdp_compositor *comp,
         /* Child: exec cage */
         setenv("WLR_BACKENDS", "headless", 1);
         setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
-        setenv("WLR_RENDERER", "pixman", 1);
+        /* Do not force pixman — it crashes on large retina modes (3024x1898+). Let wlroots choose gles2 or auto for better large-buffer support. */
+        /* setenv("WLR_RENDERER", "pixman", 1); */
         setenv("WLR_LIBINPUT_NO_DEVICES", "1", 1);
         execlp("cage", "cage", "--", "/bin/sh", "-c", wrapper, NULL);
         fprintf(stderr, "[wlrdp] ERROR: exec cage failed: %s\n",

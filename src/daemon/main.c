@@ -136,7 +136,6 @@ static BOOL on_peer_accepted(freerdp_listener *listener,
     freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
     freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE);
     freerdp_settings_set_bool(settings, FreeRDP_SurfaceCommandsEnabled, TRUE);
-    freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
     client->PostConnect = on_post_connect;
     client->Activate = on_activate;

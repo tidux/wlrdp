@@ -6,6 +6,7 @@
 #include <freerdp/freerdp.h>
 #include <freerdp/peer.h>
 #include <freerdp/settings.h>
+#include <freerdp/constants.h>
 #include <freerdp/codec/nsc.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
@@ -34,47 +35,79 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
     freerdp_peer *client = context->rdpcontext->peer;
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
+    rdpSettings *settings = client->context->settings;
 
-    /* Accept the first capability set that supports AVC420 by checking
-     * both version and the AVC420_ENABLED flag (per MS-RDPEGFX spec). */
-    bool found_avc420 = false;
+    /* Scan capability sets for H.264 support.
+     * Prefer AVC444v2 > AVC444 > AVC420 for non-mac clients.
+     * Microsoft "Windows App" on macOS (and other macOS RDP clients) trigger
+     * black screens with AVC444 due to VideoToolbox decoder bugs (see
+     * https://github.com/neutrinolabs/xrdp/discussions/2383 ). We detect
+     * via OsMajorType at runtime and force downgrade to AVC420 (or NSCodec
+     * fallback). This is the server-side detection requested. */
+    uint32_t os_major = freerdp_settings_get_uint32(settings, FreeRDP_OsMajorType);
+    bool is_macos_client = (os_major == OSMAJORTYPE_MACINTOSH ||
+                            os_major == OSMAJORTYPE_OSX ||
+                            os_major == OSMAJORTYPE_IOS);
+
+    int best_rank = -1;
     uint32_t chosen = 0;
 
     for (uint32_t i = 0; i < pdu->capsSetCount; i++) {
         const RDPGFX_CAPSET *cap = &pdu->capsSets[i];
-        bool supports_avc = false;
+        int rank = 0;  /* 0 = no AVC, 1 = AVC420, 2 = AVC444, 3 = AVC444v2 */
 
         if (cap->version >= RDPGFX_CAPVERSION_10) {
             if (!(cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) {
-                supports_avc = true;
+                if (is_macos_client) {
+                    rank = 1;  /* Force downgrade for macOS Windows App to avoid black screen */
+                } else if (cap->version >= RDPGFX_CAPVERSION_107) {
+                    rank = 3;  /* AVC444v2 */
+                } else {
+                    rank = 2;  /* AVC444 */
+                }
             }
         } else if (cap->version >= RDPGFX_CAPVERSION_81 &&
                    (cap->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED)) {
-            supports_avc = true;
+            rank = 1;  /* AVC420 only */
         }
 
-        if (supports_avc) {
-            chosen = i;
-            found_avc420 = true;
-            break;
-        }
-        if (cap->version >= RDPGFX_CAPVERSION_81) {
+        if (rank > best_rank) {
+            best_rank = rank;
             chosen = i;
         }
+    }
+
+    /* If no caps at all, pick the first one */
+    if (best_rank < 0 && pdu->capsSetCount > 0) {
+        chosen = 0;
     }
 
     RDPGFX_CAPS_CONFIRM_PDU confirm = {
         .capsSet = &pdu->capsSets[chosen],
     };
 
-    if (found_avc420) {
+    const char *client_type = is_macos_client ? " (macOS/Windows App - forced AVC420)" : "";
+    switch (best_rank) {
+    case 3:
+        ctx->send_mode = WLRDP_SEND_GFX_AVC444V2;
+        WLRDP_LOG_INFO("GFX: client supports AVC444v2 (caps version 0x%08x)%s",
+                        pdu->capsSets[chosen].version, client_type);
+        break;
+    case 2:
+        ctx->send_mode = WLRDP_SEND_GFX_AVC444;
+        WLRDP_LOG_INFO("GFX: client supports AVC444 (caps version 0x%08x)%s",
+                        pdu->capsSets[chosen].version, client_type);
+        break;
+    case 1:
         ctx->send_mode = WLRDP_SEND_GFX_AVC420;
-        WLRDP_LOG_INFO("GFX: client supports AVC420 (caps version 0x%08x)",
-                        pdu->capsSets[chosen].version);
-    } else {
+        WLRDP_LOG_INFO("GFX: client supports AVC420 (caps version 0x%08x)%s",
+                        pdu->capsSets[chosen].version, client_type);
+        break;
+    default:
         ctx->send_mode = WLRDP_SEND_SURFACE_BITS;
-        WLRDP_LOG_INFO("GFX: client does not support AVC420, "
-                        "falling back to SurfaceBits");
+        WLRDP_LOG_INFO("GFX: client does not support AVC, "
+                        "falling back to SurfaceBits%s", client_type);
+        break;
     }
 
     UINT rc = context->CapsConfirm(context, &confirm);
@@ -83,8 +116,11 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
 
     /* Caps negotiation complete — now create the GFX surface.
      * Use compositor dimensions (ctx->width/height), not the client's
-     * negotiated DesktopWidth/Height which may differ. */
-    if (ctx->activated && !ctx->gfx_surface_id) {
+     * negotiated DesktopWidth/Height which may differ.
+     * Note: removed `activated` guard because MS RDP client sends
+     * GFX caps advertise before the Activate callback (xfreerdp does
+     * not); this fixes "failing to initialize the video stream". */
+    if (!ctx->gfx_surface_id) {
         uint32_t w = ctx->width;
         uint32_t h = ctx->height;
         if (gfx_create_surface(ctx, w, h)) {
@@ -568,6 +604,24 @@ static BOOL on_post_connect(freerdp_peer *client)
         freerdp_settings_get_bool(settings, FreeRDP_SurfaceCommandsEnabled),
         freerdp_settings_get_bool(settings, FreeRDP_GfxH264));
 
+    uint32_t os_major = freerdp_settings_get_uint32(settings, FreeRDP_OsMajorType);
+    const char *os_name = "Other";
+    if (os_major == OSMAJORTYPE_WINDOWS) os_name = "Windows";
+    else if (os_major == OSMAJORTYPE_MACINTOSH) os_name = "Macintosh";
+    else if (os_major == OSMAJORTYPE_OSX) os_name = "macOS";
+    else if (os_major == OSMAJORTYPE_UNIX) os_name = "Unix";
+    else if (os_major == OSMAJORTYPE_IOS) os_name = "iOS";
+    WLRDP_LOG_INFO("client OS major type: 0x%04x (%s)", os_major, os_name);
+
+    uint32_t depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
+    switch (depth) {
+    case 32: ctx->pixel_format = PIXEL_FORMAT_BGRX32; break;
+    case 24: ctx->pixel_format = PIXEL_FORMAT_BGR24; break;
+    case 16: ctx->pixel_format = PIXEL_FORMAT_RGB16; break;
+    default: ctx->pixel_format = PIXEL_FORMAT_BGRX32; break;
+    }
+    WLRDP_LOG_INFO("negotiated pixel format: 0x%08x (%u bpp)", ctx->pixel_format, depth);
+
     /* Start VCM + DRDYNVC handshake — GFX opens later via rdp_peer_check_vcm */
     if (freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline)) {
         vcm_init(ctx);
@@ -588,10 +642,16 @@ static BOOL on_activate(freerdp_peer *client)
     uint32_t client_height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
     uint32_t scale = get_desktop_scale(settings);
 
+    const char *mode_str;
+    switch (ctx->send_mode) {
+    case WLRDP_SEND_GFX_AVC444V2: mode_str = "GFX_AVC444v2"; break;
+    case WLRDP_SEND_GFX_AVC444:   mode_str = "GFX_AVC444"; break;
+    case WLRDP_SEND_GFX_AVC420:   mode_str = "GFX_AVC420"; break;
+    default:                      mode_str = "SurfaceBits"; break;
+    }
+
     WLRDP_LOG_INFO("RDP peer activated (send_mode=%s, res=%ux%u, scale=%u%%)",
-                    ctx->send_mode == WLRDP_SEND_GFX_AVC420
-                        ? "GFX_AVC420" : "SurfaceBits",
-                    client_width, client_height, scale);
+                    mode_str, client_width, client_height, scale);
 
     /* Hide the client's local cursor. The server cursor is composited
      * into the frame by cage, so the client must not draw its own. */
@@ -643,16 +703,20 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE);
 
     freerdp_settings_set_bool(settings, FreeRDP_SurfaceCommandsEnabled, TRUE);
-    freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
     /* Enable NSCodec for SurfaceBits fallback path */
     freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_NSCodecAllowSubsampling, TRUE);
 
-    /* Advertise GFX pipeline support */
+    /* Advertise GFX pipeline support.
+     * AVC444/AVC444v2 disabled server-wide to avoid RGBToAVC444YUV bus error on ARM
+     * (Apple Silicon build). Runtime detection in gfx_caps_advertise now forces
+     * Microsoft Windows App / macOS clients to AVC420 (or NSCodec fallback) to
+     * workaround VideoToolbox black screen bug. */
     freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, FALSE);
 
     /* Dynamic Resolution / Monitor Layout */
     freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, TRUE);
@@ -683,7 +747,20 @@ bool rdp_peer_supports_gfx_h264(freerdp_peer *client)
 {
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
-    return ctx->gfx_ready && ctx->send_mode == WLRDP_SEND_GFX_AVC420;
+    if (!ctx->gfx_ready)
+        return false;
+    return ctx->send_mode == WLRDP_SEND_GFX_AVC420 ||
+           ctx->send_mode == WLRDP_SEND_GFX_AVC444 ||
+           ctx->send_mode == WLRDP_SEND_GFX_AVC444V2;
+}
+
+enum wlrdp_send_mode rdp_peer_get_send_mode(freerdp_peer *client)
+{
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+    if (!ctx->gfx_ready)
+        return WLRDP_SEND_SURFACE_BITS;
+    return ctx->send_mode;
 }
 
 int rdp_peer_get_vcm_fd(freerdp_peer *client)
@@ -796,7 +873,7 @@ static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
     RDPGFX_SURFACE_COMMAND cmd = {
         .surfaceId = ctx->gfx_surface_id,
         .codecId = RDPGFX_CODECID_AVC420,
-        .format = PIXEL_FORMAT_BGRX32,
+        .format = ctx->pixel_format,
         .left = 0,
         .top = 0,
         .right = width,
@@ -820,12 +897,103 @@ static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
     return true;
 }
 
+static bool send_gfx_avc444(struct wlrdp_peer_context *ctx,
+                             uint8_t *main_data, uint32_t main_len,
+                             uint8_t *aux_data, uint32_t aux_len,
+                             uint32_t width, uint32_t height,
+                             bool is_avc444v2)
+{
+    RdpgfxServerContext *gfx = ctx->gfx_context;
+
+    RECTANGLE_16 region_rect = {
+        .left = 0, .top = 0,
+        .right = (UINT16)width, .bottom = (UINT16)height,
+    };
+
+    RDPGFX_H264_QUANT_QUALITY quant_qual = {
+        .qp = 22,
+        .qualityVal = 100,
+        .qpVal = 22,
+    };
+
+    /* LC per MS-RDPEGFX: 0 = both luma+chroma streams, 1 = luma only, 2 = chroma only */
+    BYTE lc;
+    if (main_len > 0 && aux_len > 0) lc = 0;
+    else if (main_len > 0)           lc = 1;
+    else                             lc = 2;
+
+    /* cbAvc420EncodedBitstream1 = metablock1 bytes + H.264 stream 1 bytes.
+     * Metablock size = 4 (numRegionRects) + numRegionRects * (8 rect + 2 qp/qual). */
+    const uint32_t metablock1_size = 4 + 1 * 10;
+
+    RDPGFX_AVC444_BITMAP_STREAM avc444 = {
+        .cbAvc420EncodedBitstream1 = metablock1_size + main_len,
+        .LC = lc,
+        .bitstream = {
+            [0] = {
+                .meta = {
+                    .numRegionRects = 1,
+                    .regionRects = &region_rect,
+                    .quantQualityVals = &quant_qual,
+                },
+                .length = main_len,
+                .data = main_data,
+            },
+            [1] = {
+                .meta = {
+                    .numRegionRects = 1,
+                    .regionRects = &region_rect,
+                    .quantQualityVals = &quant_qual,
+                },
+                .length = aux_len,
+                .data = aux_data,
+            },
+        },
+    };
+
+    ctx->gfx_frame_id++;
+
+    RDPGFX_START_FRAME_PDU start = { .frameId = ctx->gfx_frame_id };
+    if (gfx->StartFrame(gfx, &start) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX StartFrame failed");
+        return false;
+    }
+
+    RDPGFX_SURFACE_COMMAND cmd = {
+        .surfaceId = ctx->gfx_surface_id,
+        .codecId = is_avc444v2 ? RDPGFX_CODECID_AVC444v2
+                               : RDPGFX_CODECID_AVC444,
+        .format = ctx->pixel_format,
+        .left = 0,
+        .top = 0,
+        .right = width,
+        .bottom = height,
+        .length = main_len + aux_len,
+        .data = main_data,
+        .extra = &avc444,
+    };
+
+    if (gfx->SurfaceCommand(gfx, &cmd) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX SurfaceCommand (AVC444) failed");
+        return false;
+    }
+
+    RDPGFX_END_FRAME_PDU end = { .frameId = ctx->gfx_frame_id };
+    if (gfx->EndFrame(gfx, &end) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX EndFrame failed");
+        return false;
+    }
+
+    return true;
+}
+
 static bool send_surface_bits(freerdp_peer *client,
                                uint8_t *data, uint32_t len,
                                uint32_t width, uint32_t height)
 {
     rdpUpdate *update = client->context->update;
     rdpSettings *settings = client->context->settings;
+    struct wlrdp_peer_context *ctx = (struct wlrdp_peer_context *)client->context;
 
     SURFACE_BITS_COMMAND cmd = { 0 };
     cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
@@ -833,10 +1001,16 @@ static bool send_surface_bits(freerdp_peer *client,
     cmd.destTop = 0;
     cmd.destRight = width;
     cmd.destBottom = height;
-    cmd.bmp.bpp = 32;
+    cmd.bmp.bpp = FreeRDPGetBitsPerPixel(ctx->pixel_format);
     cmd.bmp.width = width;
     cmd.bmp.height = height;
-    cmd.bmp.codecID = freerdp_settings_get_uint32(settings, FreeRDP_NSCodecId);
+
+    if (freerdp_settings_get_bool(settings, FreeRDP_NSCodec)) {
+        cmd.bmp.codecID = RDP_CODEC_ID_NSCODEC;
+    } else {
+        cmd.bmp.codecID = RDP_CODEC_ID_NONE;
+    }
+
     cmd.bmp.bitmapDataLength = len;
     cmd.bmp.bitmapData = data;
 
@@ -850,6 +1024,7 @@ static bool send_surface_bits(freerdp_peer *client,
 
 bool rdp_peer_send_frame(freerdp_peer *client,
                          uint8_t *data, uint32_t len,
+                         uint8_t *aux_data, uint32_t aux_len,
                          uint32_t width, uint32_t height,
                          bool is_keyframe)
 {
@@ -858,8 +1033,19 @@ bool rdp_peer_send_frame(freerdp_peer *client,
 
     (void)is_keyframe; /* AVC420 metadata carries QP, not per-frame keyframe flag */
 
-    if (ctx->send_mode == WLRDP_SEND_GFX_AVC420 && ctx->gfx_ready) {
-        return send_gfx_avc420(ctx, data, len, width, height);
+    if (ctx->gfx_ready) {
+        switch (ctx->send_mode) {
+        case WLRDP_SEND_GFX_AVC444V2:
+            return send_gfx_avc444(ctx, data, len, aux_data, aux_len,
+                                   width, height, true);
+        case WLRDP_SEND_GFX_AVC444:
+            return send_gfx_avc444(ctx, data, len, aux_data, aux_len,
+                                   width, height, false);
+        case WLRDP_SEND_GFX_AVC420:
+            return send_gfx_avc420(ctx, data, len, width, height);
+        default:
+            break;
+        }
     }
 
     return send_surface_bits(client, data, len, width, height);

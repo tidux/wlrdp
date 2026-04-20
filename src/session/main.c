@@ -78,22 +78,56 @@ static void init_encoder_for_client(struct wlrdp_server *srv)
         srv->encoder_initialized = false;
     }
 
-    enum wlrdp_encoder_mode mode = WLRDP_ENCODER_NSC;
+    enum wlrdp_encoder_mode mode = WLRDP_ENCODER_RAW;
+    bool use_v2 = false;
 
-    if (srv->client && rdp_peer_supports_gfx_h264(srv->client)) {
-        mode = WLRDP_ENCODER_H264;
+    uint32_t format = PIXEL_FORMAT_BGRX32;
+    if (srv->client) {
+        struct wlrdp_peer_context *pctx =
+            (struct wlrdp_peer_context *)srv->client->context;
+        format = pctx->pixel_format;
+
+        rdpSettings *settings = srv->client->context->settings;
+
+        enum wlrdp_send_mode send_mode = rdp_peer_get_send_mode(srv->client);
+        switch (send_mode) {
+        case WLRDP_SEND_GFX_AVC444V2:
+            mode = WLRDP_ENCODER_AVC444;
+            use_v2 = true;
+            break;
+        case WLRDP_SEND_GFX_AVC444:
+            mode = WLRDP_ENCODER_AVC444;
+            break;
+        case WLRDP_SEND_GFX_AVC420:
+            mode = WLRDP_ENCODER_H264;
+            break;
+        default:
+            if (freerdp_settings_get_bool(settings, FreeRDP_NSCodec)) {
+                mode = WLRDP_ENCODER_NSC;
+            } else {
+                mode = WLRDP_ENCODER_RAW;
+            }
+            break;
+        }
     }
 
-    if (!encoder_init(&srv->encoder, mode, srv->width, srv->height)) {
+    if (!encoder_init(&srv->encoder, mode, srv->width, srv->height, use_v2, format)) {
         WLRDP_LOG_ERROR("failed to initialize encoder");
         return;
     }
 
+    encoder_request_keyframe(&srv->encoder); /* Ensure first frame is IDR (helps initial render/prompt) */
+
     srv->encoder_initialized = true;
 
-    WLRDP_LOG_INFO("encoder mode: %s",
-                    srv->encoder.mode == WLRDP_ENCODER_H264
-                        ? "H.264" : "NSCodec");
+    const char *mode_str;
+    switch (srv->encoder.mode) {
+    case WLRDP_ENCODER_AVC444: mode_str = srv->encoder.avc444v2 ? "AVC444v2" : "AVC444"; break;
+    case WLRDP_ENCODER_H264:   mode_str = "H.264 (AVC420)"; break;
+    case WLRDP_ENCODER_NSC:    mode_str = "NSCodec"; break;
+    default:                   mode_str = "RAW"; break;
+    }
+    WLRDP_LOG_INFO("encoder mode: %s", mode_str);
 }
 
 static void on_frame_ready(void *data, uint8_t *pixels,
@@ -113,21 +147,6 @@ static void on_frame_ready(void *data, uint8_t *pixels,
 
     uint64_t encode_start = now;
 
-    /* For SurfaceBits/NSCodec mode, flip the image (screencopy is top-down,
-     * SurfaceBits expects bottom-up). */
-    if (srv->encoder.mode == WLRDP_ENCODER_NSC) {
-        uint32_t row_bytes = width * 4;
-        for (uint32_t top = 0, bot = height - 1; top < bot; top++, bot--) {
-            uint8_t *a = pixels + top * stride;
-            uint8_t *b = pixels + bot * stride;
-            for (uint32_t i = 0; i < row_bytes; i++) {
-                uint8_t tmp = a[i];
-                a[i] = b[i];
-                b[i] = tmp;
-            }
-        }
-    }
-
     if (!encoder_encode(&srv->encoder, pixels, stride)) {
         capture_request_frame(&srv->capture);
         return;
@@ -139,9 +158,10 @@ static void on_frame_ready(void *data, uint8_t *pixels,
         return;
     }
 
-    rdp_peer_send_frame(srv->client, srv->encoder.out_buf,
-                        srv->encoder.out_len, width, height,
-                        srv->encoder.is_keyframe);
+    rdp_peer_send_frame(srv->client,
+                        srv->encoder.out_buf, srv->encoder.out_len,
+                        srv->encoder.aux_buf, srv->encoder.aux_len,
+                        width, height, srv->encoder.is_keyframe);
 
     /* Adaptive framerate: target interval = 2x encode+send time,
      * clamped to [16ms, 100ms] */
@@ -164,6 +184,11 @@ static void on_peer_resize(void *data, uint32_t width, uint32_t height, uint32_t
     /* width/height from the RDP client are already physical pixel dimensions.
      * scale is the client's DPI scale factor (e.g. 200 for Retina 2x).
      * We pass scale to wlr-randr so Wayland apps render at the right DPI. */
+
+    /* Round to multiple of 16 to avoid odd logical sizes after scale (fixes cage crash
+     * on large retina resolutions). No cap — full resolution supported with the gles2/auto renderer. */
+    width = (width + 15) & ~15;
+    height = (height + 15) & ~15;
 
     if (srv->width == (int)width && srv->height == (int)height)
         return;
@@ -441,8 +466,8 @@ int main(int argc, char *argv[])
 {
     struct wlrdp_server srv = {
         .port = WLRDP_DEFAULT_PORT,
-        .width = WLRDP_DEFAULT_WIDTH,
-        .height = WLRDP_DEFAULT_HEIGHT,
+        .width = 3840,  /* Large initial size to support full retina resolutions without crashing cage on dynamic resize from 800x600 */
+        .height = 2160,
         .desktop_cmd = "foot",
         .cert_file = NULL,
         .key_file = NULL,
