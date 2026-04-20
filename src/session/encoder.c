@@ -10,6 +10,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
+#include <freerdp/primitives.h>
 #endif
 
 /* --- NSCodec helpers --- */
@@ -275,16 +276,80 @@ static void h264_cleanup(struct wlrdp_encoder *enc)
     h264_ctx_cleanup(&enc->h264[1]);
 }
 
-/* AVC444 stubs — replaced with real implementations in Task 2 */
-static bool avc444_init(struct wlrdp_encoder *enc)
-{
-    (void)enc;
-    return false;
-}
-
 static void avc444_cleanup_buffers(struct wlrdp_encoder *enc)
 {
-    (void)enc;
+    for (int i = 0; i < 3; i++) {
+        free(enc->yuv_main[i]);
+        enc->yuv_main[i] = NULL;
+        free(enc->yuv_aux[i]);
+        enc->yuv_aux[i] = NULL;
+    }
+}
+
+static bool avc444_init(struct wlrdp_encoder *enc)
+{
+    /* Both streams use the same H.264 encoder.
+     * Find a working encoder name first, then open two instances. */
+    static const char *encoders[] = {
+        "h264_vaapi",
+        "h264_nvenc",
+        "libx264",
+        NULL,
+    };
+
+    const char *chosen = NULL;
+    for (int i = 0; encoders[i]; i++) {
+        if (h264_try_encoder(enc, encoders[i], &enc->h264[0])) {
+            chosen = encoders[i];
+            break;
+        }
+    }
+
+    if (!chosen) {
+        WLRDP_LOG_WARN("no H.264 encoder for AVC444 main stream");
+        return false;
+    }
+
+    /* Open a second encoder instance for the aux/chroma stream */
+    if (!h264_try_encoder(enc, chosen, &enc->h264[1])) {
+        WLRDP_LOG_WARN("failed to open second H.264 encoder for AVC444 aux stream");
+        h264_ctx_cleanup(&enc->h264[0]);
+        return false;
+    }
+
+    /* Allocate YUV plane buffers for RGBToAVC444YUV output.
+     * Y plane: full resolution. U,V planes: half resolution (YUV420). */
+    uint32_t w = enc->width & ~1;
+    uint32_t h = enc->height & ~1;
+    uint32_t y_stride = w;
+    uint32_t uv_stride = w / 2;
+
+    enc->yuv_stride[0] = y_stride;
+    enc->yuv_stride[1] = uv_stride;
+    enc->yuv_stride[2] = uv_stride;
+
+    for (int i = 0; i < 3; i++) {
+        uint32_t plane_stride = enc->yuv_stride[i];
+        uint32_t plane_height = (i == 0) ? h : h / 2;
+        size_t plane_size = (size_t)plane_stride * plane_height;
+
+        enc->yuv_main[i] = calloc(1, plane_size);
+        enc->yuv_aux[i] = calloc(1, plane_size);
+
+        if (!enc->yuv_main[i] || !enc->yuv_aux[i]) {
+            WLRDP_LOG_ERROR("failed to allocate AVC444 YUV buffers");
+            avc444_cleanup_buffers(enc);
+            h264_ctx_cleanup(&enc->h264[0]);
+            h264_ctx_cleanup(&enc->h264[1]);
+            return false;
+        }
+    }
+
+    enc->mode = WLRDP_ENCODER_AVC444;
+    WLRDP_LOG_INFO("encoder initialized (%ux%u, AVC444%s via %s)",
+                    enc->width, enc->height,
+                    enc->avc444v2 ? "v2" : "", chosen);
+    return true;
 }
 
 #endif /* WLRDP_HAVE_H264 */
