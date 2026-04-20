@@ -35,6 +35,7 @@ RUN dnf install -y \
     pipewire-devel \
     wireplumber \
     wl-clipboard \
+    mesa-libEGL \
     && dnf clean all
 
 # Create test users for multi-session testing

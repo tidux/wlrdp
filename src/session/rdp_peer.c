@@ -6,6 +6,7 @@
 #include <freerdp/freerdp.h>
 #include <freerdp/peer.h>
 #include <freerdp/settings.h>
+#include <freerdp/constants.h>
 #include <freerdp/codec/nsc.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
@@ -34,10 +35,20 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
     freerdp_peer *client = context->rdpcontext->peer;
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
+    rdpSettings *settings = client->context->settings;
 
     /* Scan capability sets for H.264 support.
-     * Prefer AVC444v2 > AVC444 > AVC420 > no-AVC fallback.
-     * AVC444 requires caps version >= 10 with AVC not disabled. */
+     * Prefer AVC444v2 > AVC444 > AVC420 for non-mac clients.
+     * Microsoft "Windows App" on macOS (and other macOS RDP clients) trigger
+     * black screens with AVC444 due to VideoToolbox decoder bugs (see
+     * https://github.com/neutrinolabs/xrdp/discussions/2383 ). We detect
+     * via OsMajorType at runtime and force downgrade to AVC420 (or NSCodec
+     * fallback). This is the server-side detection requested. */
+    uint32_t os_major = freerdp_settings_get_uint32(settings, FreeRDP_OsMajorType);
+    bool is_macos_client = (os_major == OSMAJORTYPE_MACINTOSH ||
+                            os_major == OSMAJORTYPE_OSX ||
+                            os_major == OSMAJORTYPE_IOS);
+
     int best_rank = -1;
     uint32_t chosen = 0;
 
@@ -47,9 +58,12 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
 
         if (cap->version >= RDPGFX_CAPVERSION_10) {
             if (!(cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) {
-                rank = 2;  /* AVC420 + AVC444 available at v10+ */
-                if (cap->version >= RDPGFX_CAPVERSION_107) {
-                    rank = 3;  /* AVC444v2 at 10.7+ */
+                if (is_macos_client) {
+                    rank = 1;  /* Force downgrade for macOS Windows App to avoid black screen */
+                } else if (cap->version >= RDPGFX_CAPVERSION_107) {
+                    rank = 3;  /* AVC444v2 */
+                } else {
+                    rank = 2;  /* AVC444 */
                 }
             }
         } else if (cap->version >= RDPGFX_CAPVERSION_81 &&
@@ -72,26 +86,27 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
         .capsSet = &pdu->capsSets[chosen],
     };
 
+    const char *client_type = is_macos_client ? " (macOS/Windows App - forced AVC420)" : "";
     switch (best_rank) {
     case 3:
         ctx->send_mode = WLRDP_SEND_GFX_AVC444V2;
-        WLRDP_LOG_INFO("GFX: client supports AVC444v2 (caps version 0x%08x)",
-                        pdu->capsSets[chosen].version);
+        WLRDP_LOG_INFO("GFX: client supports AVC444v2 (caps version 0x%08x)%s",
+                        pdu->capsSets[chosen].version, client_type);
         break;
     case 2:
         ctx->send_mode = WLRDP_SEND_GFX_AVC444;
-        WLRDP_LOG_INFO("GFX: client supports AVC444 (caps version 0x%08x)",
-                        pdu->capsSets[chosen].version);
+        WLRDP_LOG_INFO("GFX: client supports AVC444 (caps version 0x%08x)%s",
+                        pdu->capsSets[chosen].version, client_type);
         break;
     case 1:
         ctx->send_mode = WLRDP_SEND_GFX_AVC420;
-        WLRDP_LOG_INFO("GFX: client supports AVC420 (caps version 0x%08x)",
-                        pdu->capsSets[chosen].version);
+        WLRDP_LOG_INFO("GFX: client supports AVC420 (caps version 0x%08x)%s",
+                        pdu->capsSets[chosen].version, client_type);
         break;
     default:
         ctx->send_mode = WLRDP_SEND_SURFACE_BITS;
         WLRDP_LOG_INFO("GFX: client does not support AVC, "
-                        "falling back to SurfaceBits");
+                        "falling back to SurfaceBits%s", client_type);
         break;
     }
 
@@ -101,8 +116,11 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
 
     /* Caps negotiation complete — now create the GFX surface.
      * Use compositor dimensions (ctx->width/height), not the client's
-     * negotiated DesktopWidth/Height which may differ. */
-    if (ctx->activated && !ctx->gfx_surface_id) {
+     * negotiated DesktopWidth/Height which may differ.
+     * Note: removed `activated` guard because MS RDP client sends
+     * GFX caps advertise before the Activate callback (xfreerdp does
+     * not); this fixes "failing to initialize the video stream". */
+    if (!ctx->gfx_surface_id) {
         uint32_t w = ctx->width;
         uint32_t h = ctx->height;
         if (gfx_create_surface(ctx, w, h)) {
@@ -586,6 +604,15 @@ static BOOL on_post_connect(freerdp_peer *client)
         freerdp_settings_get_bool(settings, FreeRDP_SurfaceCommandsEnabled),
         freerdp_settings_get_bool(settings, FreeRDP_GfxH264));
 
+    uint32_t os_major = freerdp_settings_get_uint32(settings, FreeRDP_OsMajorType);
+    const char *os_name = "Other";
+    if (os_major == OSMAJORTYPE_WINDOWS) os_name = "Windows";
+    else if (os_major == OSMAJORTYPE_MACINTOSH) os_name = "Macintosh";
+    else if (os_major == OSMAJORTYPE_OSX) os_name = "macOS";
+    else if (os_major == OSMAJORTYPE_UNIX) os_name = "Unix";
+    else if (os_major == OSMAJORTYPE_IOS) os_name = "iOS";
+    WLRDP_LOG_INFO("client OS major type: 0x%04x (%s)", os_major, os_name);
+
     uint32_t depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
     switch (depth) {
     case 32: ctx->pixel_format = PIXEL_FORMAT_BGRX32; break;
@@ -681,11 +708,15 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_NSCodecAllowSubsampling, TRUE);
 
-    /* Advertise GFX pipeline support */
+    /* Advertise GFX pipeline support.
+     * AVC444/AVC444v2 disabled server-wide to avoid RGBToAVC444YUV bus error on ARM
+     * (Apple Silicon build). Runtime detection in gfx_caps_advertise now forces
+     * Microsoft Windows App / macOS clients to AVC420 (or NSCodec fallback) to
+     * workaround VideoToolbox black screen bug. */
     freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, FALSE);
 
     /* Dynamic Resolution / Monitor Layout */
     freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, TRUE);
@@ -716,7 +747,11 @@ bool rdp_peer_supports_gfx_h264(freerdp_peer *client)
 {
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
-    return ctx->gfx_ready && ctx->send_mode == WLRDP_SEND_GFX_AVC420;
+    if (!ctx->gfx_ready)
+        return false;
+    return ctx->send_mode == WLRDP_SEND_GFX_AVC420 ||
+           ctx->send_mode == WLRDP_SEND_GFX_AVC444 ||
+           ctx->send_mode == WLRDP_SEND_GFX_AVC444V2;
 }
 
 enum wlrdp_send_mode rdp_peer_get_send_mode(freerdp_peer *client)

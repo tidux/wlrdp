@@ -41,6 +41,10 @@ struct wlrdp_encoder {
     bool avc444v2;          /* true = use AVC444v2 chroma layout */
     uint32_t format;        /* RDP pixel format (PIXEL_FORMAT_XXX) */
 
+    /* Aligned copy of capture buffer for RGBToAVC444YUV primitive (fixes ARM bus error on unaligned screencopy buffers). */
+    uint8_t *aligned_buf;
+    uint32_t aligned_stride;
+
     /* Conversion buffer for non-32bit formats */
     uint8_t *conv_buf;
     uint32_t conv_size;

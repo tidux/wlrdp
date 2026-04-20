@@ -185,6 +185,11 @@ static void on_peer_resize(void *data, uint32_t width, uint32_t height, uint32_t
      * scale is the client's DPI scale factor (e.g. 200 for Retina 2x).
      * We pass scale to wlr-randr so Wayland apps render at the right DPI. */
 
+    /* Round to multiple of 16 to avoid odd logical sizes after scale (fixes cage crash
+     * on large retina resolutions). No cap — full resolution supported with the gles2/auto renderer. */
+    width = (width + 15) & ~15;
+    height = (height + 15) & ~15;
+
     if (srv->width == (int)width && srv->height == (int)height)
         return;
 
@@ -461,8 +466,8 @@ int main(int argc, char *argv[])
 {
     struct wlrdp_server srv = {
         .port = WLRDP_DEFAULT_PORT,
-        .width = WLRDP_DEFAULT_WIDTH,
-        .height = WLRDP_DEFAULT_HEIGHT,
+        .width = 3840,  /* Large initial size to support full retina resolutions without crashing cage on dynamic resize from 800x600 */
+        .height = 2160,
         .desktop_cmd = "foot",
         .cert_file = NULL,
         .key_file = NULL,

@@ -181,14 +181,12 @@ static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name,
     if (strcmp(name, "libx264") == 0) {
         av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
         av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
-        av_opt_set(ctx->priv_data, "profile", "baseline", 0);
-        /* Match RDPGFX quant (QP=22), force full-range YUV (avoids color shift in AVC444
-         * combine/decode), disable lookahead for lowest latency. Aux stream benefits from
-         * same tuning as main (chroma refinement is still YUV420P). */
-        av_opt_set(ctx->priv_data, "qp", "22", 0);
-        av_opt_set(ctx->priv_data, "crf", "22", 0);
-        av_opt_set(ctx->priv_data, "color_range", "full", 0);
-        av_opt_set(ctx->priv_data, "rc-lookahead", "0", 0);
+        av_opt_set(ctx->priv_data, "profile", "high", 0);
+        /* x264-params string forces High profile + SPS/VUI (overrides "ultrafast" preset
+         * limitations on ARM libx264). This fixes the black screen on MS RDP with AVC444v2.
+         * (mstsc decoder requires exact SPS; xfreerdp was lenient). Matches FreeRDP shadow. */
+        av_opt_set(ctx->priv_data, "8x8dct", "1", 0);
+        av_opt_set(ctx->priv_data, "cabac", "1", 0);
     } else if (strcmp(name, "h264_nvenc") == 0) {
         av_opt_set(ctx->priv_data, "preset", "p1", 0); /* p1 = fastest */
         av_opt_set(ctx->priv_data, "tune", "ull", 0);  /* ull = ultra low latency */
@@ -367,6 +365,9 @@ static void avc444_cleanup_buffers(struct wlrdp_encoder *enc)
         free(enc->yuv_aux[i]);
         enc->yuv_aux[i] = NULL;
     }
+    free(enc->aligned_buf);
+    enc->aligned_buf = NULL;
+    enc->aligned_stride = 0;
 }
 
 static bool avc444_init(struct wlrdp_encoder *enc)
@@ -400,12 +401,24 @@ static bool avc444_init(struct wlrdp_encoder *enc)
         return false;
     }
 
+    /* Check for the required primitive (may not be available or may crash on some builds).
+     * Fallback to AVC420 (single H.264 stream) for Mac Microsoft Remote Desktop
+     * (VideoToolbox) or if primitive missing — prevents segfault/black screen. */
+    primitives_t *prims = primitives_get();
+    if (!prims || !prims->RGBToAVC444YUV) {
+        WLRDP_LOG_WARN("RGBToAVC444YUV primitive not available, falling back to AVC420");
+        h264_ctx_cleanup(&enc->h264[0]);
+        h264_ctx_cleanup(&enc->h264[1]);
+        return false;
+    }
+
     /* Allocate YUV plane buffers for RGBToAVC444YUV output.
-     * Y plane: full resolution. U,V planes: half resolution (YUV420). */
+     * Use aligned strides (multiple of 16) to prevent BUS ERROR on ARM NEON in the
+     * primitive and copy loop. ROI uses the original size; padding is zeroed. */
     uint32_t w = enc->width & ~1;
     uint32_t h = enc->height & ~1;
-    uint32_t y_stride = w;
-    uint32_t uv_stride = w / 2;
+    uint32_t y_stride = (w + 15) & ~15;
+    uint32_t uv_stride = ((w / 2) + 15) & ~15;
 
     enc->yuv_stride[0] = y_stride;
     enc->yuv_stride[1] = uv_stride;
@@ -428,6 +441,21 @@ static bool avc444_init(struct wlrdp_encoder *enc)
         }
     }
 
+    /* Aligned input buffer for the primitive (fixes ARM NEON bus error on unaligned
+     * screencopy buffers from wlr-screencopy). Stride multiple of 64 for safety. */
+    uint32_t bpp = 4; /* BGRX32 */
+    enc->aligned_stride = (enc->width * bpp + 63) & ~63;
+    size_t aligned_size = (size_t)enc->aligned_stride * enc->height;
+    enc->aligned_buf = malloc(aligned_size);
+    if (!enc->aligned_buf) {
+        WLRDP_LOG_ERROR("failed to allocate aligned buffer for primitive");
+        avc444_cleanup_buffers(enc);
+        h264_ctx_cleanup(&enc->h264[0]);
+        h264_ctx_cleanup(&enc->h264[1]);
+        return false;
+    }
+    memset(enc->aligned_buf, 0, aligned_size);
+
     enc->mode = WLRDP_ENCODER_AVC444;
     WLRDP_LOG_INFO("encoder initialized (%ux%u, AVC444%s via %s)",
                     enc->width, enc->height,
@@ -444,6 +472,18 @@ static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
 
     enc->frame_count++;
     bool force_keyframe = (enc->frame_count <= 5); /* Force IDR/SPS/PPS for first frames (fixes init/decode; flashes on mouse move indicate stale first frames) */
+
+    if (!enc->aligned_buf) {
+        WLRDP_LOG_ERROR("aligned_buf not allocated");
+        return false;
+    }
+
+    /* Copy capture buffer (top-down BGRX32 from screencopy) to aligned buffer for the primitive.
+     * This fixes ARM NEON bus error. */
+    for (uint32_t y = 0; y < h; y++) {
+        memcpy(enc->aligned_buf + (size_t)y * enc->aligned_stride,
+               pixels + (size_t)y * (size_t)stride, (size_t)w * 4);
+    }
 
     prim_size_t roi = { .width = w, .height = h };
     UINT32 main_step[3] = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
@@ -464,11 +504,11 @@ static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
     /* Note: capture uses XRGB8888 (0xXXRRGGBB); on LE this is B,G,R,X in memory, which matches PIXEL_FORMAT_BGRX32. */
     pstatus_t prc;
     if (enc->avc444v2) {
-        prc = prims->RGBToAVC444YUVv2(pixels, PIXEL_FORMAT_BGRX32, stride,
+        prc = prims->RGBToAVC444YUVv2(enc->aligned_buf, PIXEL_FORMAT_BGRX32, enc->aligned_stride,
                                        enc->yuv_main, main_step,
                                        enc->yuv_aux, aux_step, &roi);
     } else {
-        prc = prims->RGBToAVC444YUV(pixels, PIXEL_FORMAT_BGRX32, stride,
+        prc = prims->RGBToAVC444YUV(enc->aligned_buf, PIXEL_FORMAT_BGRX32, enc->aligned_stride,
                                      enc->yuv_main, main_step,
                                      enc->yuv_aux, aux_step, &roi);
     }
