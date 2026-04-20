@@ -12,8 +12,10 @@ struct wlrdp_clipboard;
 struct wlrdp_audio;
 
 enum wlrdp_send_mode {
-    WLRDP_SEND_SURFACE_BITS,  /* Phase 1/2 fallback: SurfaceBits + NSCodec */
-    WLRDP_SEND_GFX_AVC420,    /* Phase 3: RDPGFX + H.264 */
+    WLRDP_SEND_SURFACE_BITS,    /* Phase 1/2 fallback: SurfaceBits + NSCodec */
+    WLRDP_SEND_GFX_AVC420,      /* RDPGFX + H.264 YUV420 */
+    WLRDP_SEND_GFX_AVC444,      /* RDPGFX + H.264 AVC444 */
+    WLRDP_SEND_GFX_AVC444V2,    /* RDPGFX + H.264 AVC444v2 */
 };
 
 typedef void (*rdp_peer_resize_cb)(void *data, uint32_t width, uint32_t height, uint32_t scale);
@@ -75,6 +77,12 @@ bool rdp_peer_send_frame(freerdp_peer *client,
  * Only valid after GFX negotiation completes (gfx_ready == true).
  */
 bool rdp_peer_supports_gfx_h264(freerdp_peer *client);
+
+/*
+ * Query the negotiated GFX send mode.
+ * Only valid after GFX negotiation completes (gfx_ready == true).
+ */
+enum wlrdp_send_mode rdp_peer_get_send_mode(freerdp_peer *client);
 
 /*
  * Get the file descriptor for the VCM event handle, for epoll.

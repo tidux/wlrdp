@@ -35,46 +35,64 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
 
-    /* Accept the first capability set that supports AVC420 by checking
-     * both version and the AVC420_ENABLED flag (per MS-RDPEGFX spec). */
-    bool found_avc420 = false;
+    /* Scan capability sets for H.264 support.
+     * Prefer AVC444v2 > AVC444 > AVC420 > no-AVC fallback.
+     * AVC444 requires caps version >= 10 with AVC not disabled. */
+    int best_rank = -1;
     uint32_t chosen = 0;
 
     for (uint32_t i = 0; i < pdu->capsSetCount; i++) {
         const RDPGFX_CAPSET *cap = &pdu->capsSets[i];
-        bool supports_avc = false;
+        int rank = 0;  /* 0 = no AVC, 1 = AVC420, 2 = AVC444, 3 = AVC444v2 */
 
         if (cap->version >= RDPGFX_CAPVERSION_10) {
             if (!(cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) {
-                supports_avc = true;
+                rank = 2;  /* AVC420 + AVC444 available at v10+ */
+                if (cap->version >= RDPGFX_CAPVERSION_107) {
+                    rank = 3;  /* AVC444v2 at 10.7+ */
+                }
             }
         } else if (cap->version >= RDPGFX_CAPVERSION_81 &&
                    (cap->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED)) {
-            supports_avc = true;
+            rank = 1;  /* AVC420 only */
         }
 
-        if (supports_avc) {
-            chosen = i;
-            found_avc420 = true;
-            break;
-        }
-        if (cap->version >= RDPGFX_CAPVERSION_81) {
+        if (rank > best_rank) {
+            best_rank = rank;
             chosen = i;
         }
+    }
+
+    /* If no caps at all, pick the first one */
+    if (best_rank < 0 && pdu->capsSetCount > 0) {
+        chosen = 0;
     }
 
     RDPGFX_CAPS_CONFIRM_PDU confirm = {
         .capsSet = &pdu->capsSets[chosen],
     };
 
-    if (found_avc420) {
+    switch (best_rank) {
+    case 3:
+        ctx->send_mode = WLRDP_SEND_GFX_AVC444V2;
+        WLRDP_LOG_INFO("GFX: client supports AVC444v2 (caps version 0x%08x)",
+                        pdu->capsSets[chosen].version);
+        break;
+    case 2:
+        ctx->send_mode = WLRDP_SEND_GFX_AVC444;
+        WLRDP_LOG_INFO("GFX: client supports AVC444 (caps version 0x%08x)",
+                        pdu->capsSets[chosen].version);
+        break;
+    case 1:
         ctx->send_mode = WLRDP_SEND_GFX_AVC420;
         WLRDP_LOG_INFO("GFX: client supports AVC420 (caps version 0x%08x)",
                         pdu->capsSets[chosen].version);
-    } else {
+        break;
+    default:
         ctx->send_mode = WLRDP_SEND_SURFACE_BITS;
-        WLRDP_LOG_INFO("GFX: client does not support AVC420, "
+        WLRDP_LOG_INFO("GFX: client does not support AVC, "
                         "falling back to SurfaceBits");
+        break;
     }
 
     UINT rc = context->CapsConfirm(context, &confirm);
@@ -588,10 +606,16 @@ static BOOL on_activate(freerdp_peer *client)
     uint32_t client_height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
     uint32_t scale = get_desktop_scale(settings);
 
+    const char *mode_str;
+    switch (ctx->send_mode) {
+    case WLRDP_SEND_GFX_AVC444V2: mode_str = "GFX_AVC444v2"; break;
+    case WLRDP_SEND_GFX_AVC444:   mode_str = "GFX_AVC444"; break;
+    case WLRDP_SEND_GFX_AVC420:   mode_str = "GFX_AVC420"; break;
+    default:                      mode_str = "SurfaceBits"; break;
+    }
+
     WLRDP_LOG_INFO("RDP peer activated (send_mode=%s, res=%ux%u, scale=%u%%)",
-                    ctx->send_mode == WLRDP_SEND_GFX_AVC420
-                        ? "GFX_AVC420" : "SurfaceBits",
-                    client_width, client_height, scale);
+                    mode_str, client_width, client_height, scale);
 
     /* Hide the client's local cursor. The server cursor is composited
      * into the frame by cage, so the client must not draw its own. */
@@ -652,7 +676,8 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
     /* Advertise GFX pipeline support */
     freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE);
 
     /* Dynamic Resolution / Monitor Layout */
     freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, TRUE);
@@ -684,6 +709,15 @@ bool rdp_peer_supports_gfx_h264(freerdp_peer *client)
     struct wlrdp_peer_context *ctx =
         (struct wlrdp_peer_context *)client->context;
     return ctx->gfx_ready && ctx->send_mode == WLRDP_SEND_GFX_AVC420;
+}
+
+enum wlrdp_send_mode rdp_peer_get_send_mode(freerdp_peer *client)
+{
+    struct wlrdp_peer_context *ctx =
+        (struct wlrdp_peer_context *)client->context;
+    if (!ctx->gfx_ready)
+        return WLRDP_SEND_SURFACE_BITS;
+    return ctx->send_mode;
 }
 
 int rdp_peer_get_vcm_fd(freerdp_peer *client)
