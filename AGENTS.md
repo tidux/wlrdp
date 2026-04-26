@@ -57,6 +57,20 @@ Meson with C11. Wayland protocol C bindings are generated at build time via `way
 ## Development Notes
 
 - This is a Linux-only project (epoll, SCM_RIGHTS, PAM). Development requires a Linux environment or the provided devcontainer.  If the host system is MacOS and Codex is not running in VSCode, use MCP tools to start, rebuild, restart, or run commands inside the devcontainer.
+- When using Codex on macOS, prefer the DevContainer MCP over raw Docker commands. First enumerate tools with `tool_search` for `devcontainer_exec`; once exposed, use:
+  - `mcp__devcontainer__devcontainer_up` to start or initialize the devcontainer.
+  - `mcp__devcontainer__devcontainer_exec` to run commands inside the container.
+  - `mcp__devcontainer__devcontainer_run_user_commands` only when the devcontainer's post-create/start hooks need to be rerun.
+- For normal builds through the MCP, pass the local workspace root as `workspaceFolder` and run shell commands inside the container:
+  ```json
+  {
+    "workspaceFolder": "/Users/jlane/src/wlrdp",
+    "command": ["sh", "-lc", "cd /workspace && meson compile -C build"],
+    "outputFilePath": "/tmp/wlrdp-build.log"
+  }
+  ```
+  Read `outputFilePath` from the host afterward for compiler diagnostics. Do not use `docker exec` as a fallback unless the user explicitly asks for it.
+- Worktrees are mounted under the main workspace in the devcontainer. To build a worktree such as `.worktrees/h264-freerdp-refactor`, use `workspaceFolder: "/Users/jlane/src/wlrdp"` and run `cd /workspace/.worktrees/h264-freerdp-refactor && meson compile -C build` inside the MCP command. Calling the MCP with the worktree path directly may enter `/workspace` while Meson expects `/workspace/.worktrees/...`, causing confusing regeneration errors.
 - If xfreerdp is available on the host system, test the server with the following command: `xfreerdp /u:developer /p:developer /cert:ignore /v:localhost /gfx:AVC420`
 - H.264 encoding and PipeWire capture are planned but currently disabled (`meson_options.txt`).
 - Frame data uses raw BGRX pixels (no compression yet); the vertical flip in `session/main.c:on_frame_ready` is needed because screencopy gives top-down but SurfaceBits expects bottom-up.
