@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <freerdp/channels/rdpgfx.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/peer.h>
 
@@ -16,6 +17,7 @@ enum wlrdp_send_mode {
     WLRDP_SEND_GFX_AVC420,      /* RDPGFX + H.264 YUV420 */
     WLRDP_SEND_GFX_AVC444,      /* RDPGFX + H.264 AVC444 */
     WLRDP_SEND_GFX_AVC444V2,    /* RDPGFX + H.264 AVC444v2 */
+    WLRDP_SEND_GFX_PROGRESSIVE, /* RDPGFX + Progressive */
 };
 
 typedef void (*rdp_peer_resize_cb)(void *data, uint32_t width, uint32_t height, uint32_t scale);
@@ -72,6 +74,9 @@ bool rdp_peer_init(freerdp_peer *client, const char *cert_file,
 bool rdp_peer_send_frame(freerdp_peer *client,
                          uint8_t *data, uint32_t len,
                          uint8_t *aux_data, uint32_t aux_len,
+                         const RDPGFX_H264_METABLOCK *meta,
+                         const RDPGFX_H264_METABLOCK *aux_meta,
+                         uint8_t avc444_lc,
                          uint32_t width, uint32_t height,
                          bool is_keyframe);
 

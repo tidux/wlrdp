@@ -37,8 +37,8 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
         (struct wlrdp_peer_context *)client->context;
     rdpSettings *settings = client->context->settings;
 
-    /* Scan capability sets for H.264 support.
-     * Prefer AVC444v2 > AVC444 > AVC420 for non-mac clients.
+    /* Scan capability sets for GFX codec support.
+     * Prefer AVC444v2 > AVC444 > AVC420 > Progressive for non-mac clients.
      * Microsoft "Windows App" on macOS (and other macOS RDP clients) trigger
      * black screens with AVC444 due to VideoToolbox decoder bugs (see
      * https://github.com/neutrinolabs/xrdp/discussions/2383 ). We detect
@@ -54,21 +54,23 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
 
     for (uint32_t i = 0; i < pdu->capsSetCount; i++) {
         const RDPGFX_CAPSET *cap = &pdu->capsSets[i];
-        int rank = 0;  /* 0 = no AVC, 1 = AVC420, 2 = AVC444, 3 = AVC444v2 */
+        int rank = 0;  /* 0 = no GFX codec, 1 = Progressive, 2 = AVC420, 3 = AVC444, 4 = AVC444v2 */
 
         if (cap->version >= RDPGFX_CAPVERSION_10) {
             if (!(cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED)) {
                 if (is_macos_client) {
-                    rank = 1;  /* Force downgrade for macOS Windows App to avoid black screen */
+                    rank = 2;  /* Force downgrade for macOS Windows App to avoid black screen */
                 } else if (cap->version >= RDPGFX_CAPVERSION_107) {
-                    rank = 3;  /* AVC444v2 */
+                    rank = 4;  /* AVC444v2 */
                 } else {
-                    rank = 2;  /* AVC444 */
+                    rank = 3;  /* AVC444 */
                 }
             }
         } else if (cap->version >= RDPGFX_CAPVERSION_81 &&
                    (cap->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED)) {
-            rank = 1;  /* AVC420 only */
+            rank = 2;  /* AVC420 only */
+        } else if (cap->version >= RDPGFX_CAPVERSION_81) {
+            rank = 1;  /* Progressive */
         }
 
         if (rank > best_rank) {
@@ -88,19 +90,24 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *context,
 
     const char *client_type = is_macos_client ? " (macOS/Windows App - forced AVC420)" : "";
     switch (best_rank) {
-    case 3:
+    case 4:
         ctx->send_mode = WLRDP_SEND_GFX_AVC444V2;
         WLRDP_LOG_INFO("GFX: client supports AVC444v2 (caps version 0x%08x)%s",
                         pdu->capsSets[chosen].version, client_type);
         break;
-    case 2:
+    case 3:
         ctx->send_mode = WLRDP_SEND_GFX_AVC444;
         WLRDP_LOG_INFO("GFX: client supports AVC444 (caps version 0x%08x)%s",
                         pdu->capsSets[chosen].version, client_type);
         break;
-    case 1:
+    case 2:
         ctx->send_mode = WLRDP_SEND_GFX_AVC420;
         WLRDP_LOG_INFO("GFX: client supports AVC420 (caps version 0x%08x)%s",
+                        pdu->capsSets[chosen].version, client_type);
+        break;
+    case 1:
+        ctx->send_mode = WLRDP_SEND_GFX_PROGRESSIVE;
+        WLRDP_LOG_INFO("GFX: client supports Progressive (caps version 0x%08x)%s",
                         pdu->capsSets[chosen].version, client_type);
         break;
     default:
@@ -647,6 +654,7 @@ static BOOL on_activate(freerdp_peer *client)
     case WLRDP_SEND_GFX_AVC444V2: mode_str = "GFX_AVC444v2"; break;
     case WLRDP_SEND_GFX_AVC444:   mode_str = "GFX_AVC444"; break;
     case WLRDP_SEND_GFX_AVC420:   mode_str = "GFX_AVC420"; break;
+    case WLRDP_SEND_GFX_PROGRESSIVE: mode_str = "GFX_PROGRESSIVE"; break;
     default:                      mode_str = "SurfaceBits"; break;
     }
 
@@ -751,7 +759,8 @@ bool rdp_peer_supports_gfx_h264(freerdp_peer *client)
         return false;
     return ctx->send_mode == WLRDP_SEND_GFX_AVC420 ||
            ctx->send_mode == WLRDP_SEND_GFX_AVC444 ||
-           ctx->send_mode == WLRDP_SEND_GFX_AVC444V2;
+           ctx->send_mode == WLRDP_SEND_GFX_AVC444V2 ||
+           ctx->send_mode == WLRDP_SEND_GFX_PROGRESSIVE;
 }
 
 enum wlrdp_send_mode rdp_peer_get_send_mode(freerdp_peer *client)
@@ -837,27 +846,16 @@ bool rdp_peer_check_vcm(freerdp_peer *client)
 
 static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
                              uint8_t *data, uint32_t len,
+                             const RDPGFX_H264_METABLOCK *meta,
                              uint32_t width, uint32_t height)
 {
     RdpgfxServerContext *gfx = ctx->gfx_context;
 
-    RECTANGLE_16 region_rect = {
-        .left = 0, .top = 0,
-        .right = (UINT16)width, .bottom = (UINT16)height,
-    };
-
-    RDPGFX_H264_QUANT_QUALITY quant_qual = {
-        .qp = 22,
-        .qualityVal = 100,
-        .qpVal = 22,
-    };
+    if (!meta || meta->numRegionRects == 0 || len == 0)
+        return true;
 
     RDPGFX_AVC420_BITMAP_STREAM avc420 = {
-        .meta = {
-            .numRegionRects = 1,
-            .regionRects = &region_rect,
-            .quantQualityVals = &quant_qual,
-        },
+        .meta = *meta,
         .length = len,
         .data = data,
     };
@@ -900,51 +898,32 @@ static bool send_gfx_avc420(struct wlrdp_peer_context *ctx,
 static bool send_gfx_avc444(struct wlrdp_peer_context *ctx,
                              uint8_t *main_data, uint32_t main_len,
                              uint8_t *aux_data, uint32_t aux_len,
+                             const RDPGFX_H264_METABLOCK *meta,
+                             const RDPGFX_H264_METABLOCK *aux_meta,
+                             uint8_t avc444_lc,
                              uint32_t width, uint32_t height,
                              bool is_avc444v2)
 {
     RdpgfxServerContext *gfx = ctx->gfx_context;
 
-    RECTANGLE_16 region_rect = {
-        .left = 0, .top = 0,
-        .right = (UINT16)width, .bottom = (UINT16)height,
-    };
-
-    RDPGFX_H264_QUANT_QUALITY quant_qual = {
-        .qp = 22,
-        .qualityVal = 100,
-        .qpVal = 22,
-    };
-
-    /* LC per MS-RDPEGFX: 0 = both luma+chroma streams, 1 = luma only, 2 = chroma only */
-    BYTE lc;
-    if (main_len > 0 && aux_len > 0) lc = 0;
-    else if (main_len > 0)           lc = 1;
-    else                             lc = 2;
+    if (!meta || !aux_meta || (main_len == 0 && aux_len == 0))
+        return true;
 
     /* cbAvc420EncodedBitstream1 = metablock1 bytes + H.264 stream 1 bytes.
      * Metablock size = 4 (numRegionRects) + numRegionRects * (8 rect + 2 qp/qual). */
-    const uint32_t metablock1_size = 4 + 1 * 10;
+    const uint32_t metablock1_size = 4 + meta->numRegionRects * 10;
 
     RDPGFX_AVC444_BITMAP_STREAM avc444 = {
         .cbAvc420EncodedBitstream1 = metablock1_size + main_len,
-        .LC = lc,
+        .LC = avc444_lc,
         .bitstream = {
             [0] = {
-                .meta = {
-                    .numRegionRects = 1,
-                    .regionRects = &region_rect,
-                    .quantQualityVals = &quant_qual,
-                },
+                .meta = *meta,
                 .length = main_len,
                 .data = main_data,
             },
             [1] = {
-                .meta = {
-                    .numRegionRects = 1,
-                    .regionRects = &region_rect,
-                    .quantQualityVals = &quant_qual,
-                },
+                .meta = *aux_meta,
                 .length = aux_len,
                 .data = aux_data,
             },
@@ -975,6 +954,49 @@ static bool send_gfx_avc444(struct wlrdp_peer_context *ctx,
 
     if (gfx->SurfaceCommand(gfx, &cmd) != CHANNEL_RC_OK) {
         WLRDP_LOG_WARN("GFX SurfaceCommand (AVC444) failed");
+        return false;
+    }
+
+    RDPGFX_END_FRAME_PDU end = { .frameId = ctx->gfx_frame_id };
+    if (gfx->EndFrame(gfx, &end) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX EndFrame failed");
+        return false;
+    }
+
+    return true;
+}
+
+static bool send_gfx_progressive(struct wlrdp_peer_context *ctx,
+                                 uint8_t *data, uint32_t len,
+                                 uint32_t width, uint32_t height)
+{
+    RdpgfxServerContext *gfx = ctx->gfx_context;
+
+    if (!data || len == 0)
+        return true;
+
+    ctx->gfx_frame_id++;
+
+    RDPGFX_START_FRAME_PDU start = { .frameId = ctx->gfx_frame_id };
+    if (gfx->StartFrame(gfx, &start) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX StartFrame failed");
+        return false;
+    }
+
+    RDPGFX_SURFACE_COMMAND cmd = {
+        .surfaceId = ctx->gfx_surface_id,
+        .codecId = RDPGFX_CODECID_CAPROGRESSIVE,
+        .format = ctx->pixel_format,
+        .left = 0,
+        .top = 0,
+        .right = width,
+        .bottom = height,
+        .length = len,
+        .data = data,
+    };
+
+    if (gfx->SurfaceCommand(gfx, &cmd) != CHANNEL_RC_OK) {
+        WLRDP_LOG_WARN("GFX SurfaceCommand (Progressive) failed");
         return false;
     }
 
@@ -1025,6 +1047,9 @@ static bool send_surface_bits(freerdp_peer *client,
 bool rdp_peer_send_frame(freerdp_peer *client,
                          uint8_t *data, uint32_t len,
                          uint8_t *aux_data, uint32_t aux_len,
+                         const RDPGFX_H264_METABLOCK *meta,
+                         const RDPGFX_H264_METABLOCK *aux_meta,
+                         uint8_t avc444_lc,
                          uint32_t width, uint32_t height,
                          bool is_keyframe)
 {
@@ -1037,12 +1062,16 @@ bool rdp_peer_send_frame(freerdp_peer *client,
         switch (ctx->send_mode) {
         case WLRDP_SEND_GFX_AVC444V2:
             return send_gfx_avc444(ctx, data, len, aux_data, aux_len,
+                                   meta, aux_meta, avc444_lc,
                                    width, height, true);
         case WLRDP_SEND_GFX_AVC444:
             return send_gfx_avc444(ctx, data, len, aux_data, aux_len,
+                                   meta, aux_meta, avc444_lc,
                                    width, height, false);
         case WLRDP_SEND_GFX_AVC420:
-            return send_gfx_avc420(ctx, data, len, width, height);
+            return send_gfx_avc420(ctx, data, len, meta, width, height);
+        case WLRDP_SEND_GFX_PROGRESSIVE:
+            return send_gfx_progressive(ctx, data, len, width, height);
         default:
             break;
         }

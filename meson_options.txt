@@ -1,4 +1,8 @@
 option('enable-h264', type: 'feature', value: 'auto',
-    description: 'H.264 encoding via FFmpeg (Phase 3)')
+    description: 'H.264 encoding via FreeRDP codec APIs')
+option('prefer_hardware_h264', type: 'combo',
+    choices: ['auto', 'enabled', 'disabled'],
+    value: 'auto',
+    description: 'Prefer hardware H.264 encoding when available')
 option('enable-pipewire', type: 'feature', value: 'auto',
     description: 'PipeWire audio capture (Phase 4)')

@@ -19,10 +19,6 @@ session_deps = [
     common_dep,
 ]
 
-if have_h264
-    session_deps += [libavcodec_dep, libavutil_dep, libswscale_dep]
-endif
-
 if have_pipewire
     session_deps += [pipewire_dep]
 endif

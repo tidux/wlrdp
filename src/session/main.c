@@ -79,7 +79,7 @@ static void init_encoder_for_client(struct wlrdp_server *srv)
     }
 
     enum wlrdp_encoder_mode mode = WLRDP_ENCODER_RAW;
-    bool use_v2 = false;
+    uint8_t avc444_version = 0;
 
     uint32_t format = PIXEL_FORMAT_BGRX32;
     if (srv->client) {
@@ -92,18 +92,24 @@ static void init_encoder_for_client(struct wlrdp_server *srv)
         enum wlrdp_send_mode send_mode = rdp_peer_get_send_mode(srv->client);
         switch (send_mode) {
         case WLRDP_SEND_GFX_AVC444V2:
-            mode = WLRDP_ENCODER_AVC444;
-            use_v2 = true;
+            mode = WLRDP_ENCODER_H264_FREERDP;
+            avc444_version = 2;
             break;
         case WLRDP_SEND_GFX_AVC444:
-            mode = WLRDP_ENCODER_AVC444;
+            mode = WLRDP_ENCODER_H264_FREERDP;
+            avc444_version = 1;
             break;
         case WLRDP_SEND_GFX_AVC420:
-            mode = WLRDP_ENCODER_H264;
+            mode = WLRDP_ENCODER_H264_FREERDP;
+            avc444_version = 0;
+            break;
+        case WLRDP_SEND_GFX_PROGRESSIVE:
+            mode = WLRDP_ENCODER_PROGRESSIVE;
+            avc444_version = 0;
             break;
         default:
             if (freerdp_settings_get_bool(settings, FreeRDP_NSCodec)) {
-                mode = WLRDP_ENCODER_NSC;
+                mode = WLRDP_ENCODER_NSAC;
             } else {
                 mode = WLRDP_ENCODER_RAW;
             }
@@ -111,7 +117,8 @@ static void init_encoder_for_client(struct wlrdp_server *srv)
         }
     }
 
-    if (!encoder_init(&srv->encoder, mode, srv->width, srv->height, use_v2, format)) {
+    if (!encoder_init(&srv->encoder, mode, srv->width, srv->height,
+                      avc444_version, format)) {
         WLRDP_LOG_ERROR("failed to initialize encoder");
         return;
     }
@@ -122,9 +129,12 @@ static void init_encoder_for_client(struct wlrdp_server *srv)
 
     const char *mode_str;
     switch (srv->encoder.mode) {
-    case WLRDP_ENCODER_AVC444: mode_str = srv->encoder.avc444v2 ? "AVC444v2" : "AVC444"; break;
-    case WLRDP_ENCODER_H264:   mode_str = "H.264 (AVC420)"; break;
-    case WLRDP_ENCODER_NSC:    mode_str = "NSCodec"; break;
+    case WLRDP_ENCODER_H264_FREERDP:
+        mode_str = avc444_version == 2 ? "AVC444v2" :
+                   avc444_version == 1 ? "AVC444" : "H.264 (AVC420)";
+        break;
+    case WLRDP_ENCODER_PROGRESSIVE: mode_str = "Progressive"; break;
+    case WLRDP_ENCODER_NSAC: mode_str = "NSCodec"; break;
     default:                   mode_str = "RAW"; break;
     }
     WLRDP_LOG_INFO("encoder mode: %s", mode_str);
@@ -152,7 +162,7 @@ static void on_frame_ready(void *data, uint8_t *pixels,
         return;
     }
 
-    if (srv->encoder.out_len == 0) {
+    if (srv->encoder.out_len == 0 && srv->encoder.aux_len == 0) {
         /* Encoder buffering (shouldn't happen with zerolatency) */
         capture_request_frame(&srv->capture);
         return;
@@ -161,6 +171,9 @@ static void on_frame_ready(void *data, uint8_t *pixels,
     rdp_peer_send_frame(srv->client,
                         srv->encoder.out_buf, srv->encoder.out_len,
                         srv->encoder.aux_buf, srv->encoder.aux_len,
+                        &srv->encoder.h264_meta,
+                        &srv->encoder.h264_aux_meta,
+                        srv->encoder.avc444_lc,
                         width, height, srv->encoder.is_keyframe);
 
     /* Adaptive framerate: target interval = 2x encode+send time,

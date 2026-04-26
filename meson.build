@@ -18,12 +18,16 @@ xkbcommon_dep = dependency('xkbcommon')
 pam_dep = dependency('pam')
 
 h264_opt = get_option('enable-h264')
-libavcodec_dep = dependency('libavcodec', required: h264_opt)
-libavutil_dep = dependency('libavutil', required: h264_opt)
-libswscale_dep = dependency('libswscale', required: h264_opt)
-have_h264 = libavcodec_dep.found() and libavutil_dep.found() and libswscale_dep.found()
+have_h264 = not h264_opt.disabled()
 if have_h264
     add_project_arguments('-DWLRDP_HAVE_H264=1', language: 'c')
+endif
+
+prefer_hw_h264 = get_option('prefer_hardware_h264')
+if prefer_hw_h264 == 'disabled'
+    add_project_arguments('-DPREFER_HW_H264=0', language: 'c')
+else
+    add_project_arguments('-DPREFER_HW_H264=1', language: 'c')
 endif
 
 pw_opt = get_option('enable-pipewire')

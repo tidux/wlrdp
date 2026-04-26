@@ -1,64 +1,73 @@
 #include "encoder.h"
 #include "common.h"
 
-#include <freerdp/codec/nsc.h>
 #include <freerdp/codec/color.h>
-#include <winpr/stream.h>
+#include <freerdp/codec/region.h>
 
-#ifdef WLRDP_HAVE_H264
-#include <libavcodec/avcodec.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/opt.h>
-#include <libswscale/swscale.h>
-#include <freerdp/primitives.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef PREFER_HW_H264
+#define PREFER_HW_H264 1
 #endif
 
-/* --- RAW helpers --- */
+static void
+encoder_clear_h264_metadata(struct wlrdp_encoder *enc)
+{
+    free_h264_metablock(&enc->h264_meta);
+    free_h264_metablock(&enc->h264_aux_meta);
+    memset(&enc->h264_meta, 0, sizeof(enc->h264_meta));
+    memset(&enc->h264_aux_meta, 0, sizeof(enc->h264_aux_meta));
+}
 
-static bool raw_init(struct wlrdp_encoder *enc)
+static bool
+raw_init(struct wlrdp_encoder *enc)
 {
     enc->mode = WLRDP_ENCODER_RAW;
     WLRDP_LOG_INFO("encoder initialized (%ux%u, RAW)", enc->width, enc->height);
     return true;
 }
 
-static bool raw_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
-                       uint32_t stride)
+static bool
+raw_encode(struct wlrdp_encoder *enc, const uint8_t *pixels, uint32_t stride)
 {
     uint32_t bpp = FreeRDPGetBitsPerPixel(enc->format);
     uint32_t dst_stride = (enc->width * bpp + 7) / 8;
     uint32_t needed = dst_stride * enc->height;
 
     if (enc->conv_size < needed) {
-        enc->conv_buf = realloc(enc->conv_buf, needed);
+        uint8_t *tmp = realloc(enc->conv_buf, needed);
+        if (!tmp)
+            return false;
+        enc->conv_buf = tmp;
         enc->conv_size = needed;
     }
 
-    /* Screencopy is top-down, SurfaceBits/NSCodec expects bottom-up.
-     * Always flip in RAW and NSC modes. */
     if (!freerdp_image_copy(enc->conv_buf, enc->format, dst_stride, 0, 0,
-                             enc->width, enc->height, pixels, PIXEL_FORMAT_BGRX32,
-                             stride, 0, 0, NULL, FREERDP_FLIP_VERTICAL)) {
-        WLRDP_LOG_ERROR("freerdp_image_copy failed for raw conversion+flip to 0x%x", enc->format);
+                            enc->width, enc->height, pixels, PIXEL_FORMAT_BGRX32,
+                            stride, 0, 0, NULL, FREERDP_FLIP_VERTICAL)) {
+        WLRDP_LOG_ERROR("freerdp_image_copy failed for raw conversion");
         return false;
     }
 
     enc->out_buf = enc->conv_buf;
     enc->out_len = needed;
+    enc->aux_buf = NULL;
+    enc->aux_len = 0;
     enc->is_keyframe = true;
     return true;
 }
 
-static void raw_cleanup(struct wlrdp_encoder *enc)
+static void
+raw_cleanup(struct wlrdp_encoder *enc)
 {
     free(enc->conv_buf);
     enc->conv_buf = NULL;
     enc->conv_size = 0;
 }
 
-/* --- NSCodec helpers --- */
-
-static bool nsc_init(struct wlrdp_encoder *enc)
+static bool
+nsc_init(struct wlrdp_encoder *enc)
 {
     NSC_CONTEXT *nsc = nsc_context_new();
     if (!nsc) {
@@ -76,57 +85,59 @@ static bool nsc_init(struct wlrdp_encoder *enc)
         return false;
     }
 
-    wStream *s = Stream_New(NULL, enc->width * enc->height * 4);
-    if (!s) {
-        WLRDP_LOG_ERROR("failed to create encoder stream");
+    wStream *stream = Stream_New(NULL, enc->width * enc->height * 4);
+    if (!stream) {
+        WLRDP_LOG_ERROR("failed to create NSCodec stream");
         nsc_context_free(nsc);
         return false;
     }
 
     enc->nsc_ctx = nsc;
-    enc->nsc_stream = s;
-    enc->mode = WLRDP_ENCODER_NSC;
+    enc->nsc_stream = stream;
+    enc->mode = WLRDP_ENCODER_NSAC;
     WLRDP_LOG_INFO("encoder initialized (%ux%u, NSCodec)", enc->width, enc->height);
     return true;
 }
 
-static bool nsc_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
-                       uint32_t stride)
+static bool
+nsc_encode(struct wlrdp_encoder *enc, const uint8_t *pixels, uint32_t stride)
 {
-    NSC_CONTEXT *nsc = enc->nsc_ctx;
-    wStream *s = enc->nsc_stream;
-
     uint32_t bpp = FreeRDPGetBitsPerPixel(enc->format);
     uint32_t dst_stride = (enc->width * bpp + 7) / 8;
     uint32_t needed = dst_stride * enc->height;
 
     if (enc->conv_size < needed) {
-        enc->conv_buf = realloc(enc->conv_buf, needed);
+        uint8_t *tmp = realloc(enc->conv_buf, needed);
+        if (!tmp)
+            return false;
+        enc->conv_buf = tmp;
         enc->conv_size = needed;
     }
 
-    /* Flip vertically: screencopy top-down -> NSCodec bottom-up */
     if (!freerdp_image_copy(enc->conv_buf, enc->format, dst_stride, 0, 0,
-                             enc->width, enc->height, pixels, PIXEL_FORMAT_BGRX32,
-                             stride, 0, 0, NULL, FREERDP_FLIP_VERTICAL)) {
-        WLRDP_LOG_ERROR("freerdp_image_copy failed for nsc conversion+flip to 0x%x", enc->format);
+                            enc->width, enc->height, pixels, PIXEL_FORMAT_BGRX32,
+                            stride, 0, 0, NULL, FREERDP_FLIP_VERTICAL)) {
+        WLRDP_LOG_ERROR("freerdp_image_copy failed for NSCodec conversion");
         return false;
     }
 
-    Stream_SetPosition(s, 0);
-
-    if (!nsc_compose_message(nsc, s, enc->conv_buf, enc->width, enc->height, dst_stride)) {
+    Stream_SetPosition(enc->nsc_stream, 0);
+    if (!nsc_compose_message(enc->nsc_ctx, enc->nsc_stream, enc->conv_buf,
+                             enc->width, enc->height, dst_stride)) {
         WLRDP_LOG_ERROR("nsc_compose_message failed");
         return false;
     }
 
-    enc->out_buf = Stream_Buffer(s);
-    enc->out_len = (uint32_t)Stream_GetPosition(s);
-    enc->is_keyframe = true; /* NSCodec frames are always complete */
+    enc->out_buf = Stream_Buffer(enc->nsc_stream);
+    enc->out_len = (uint32_t)Stream_GetPosition(enc->nsc_stream);
+    enc->aux_buf = NULL;
+    enc->aux_len = 0;
+    enc->is_keyframe = true;
     return true;
 }
 
-static void nsc_cleanup(struct wlrdp_encoder *enc)
+static void
+nsc_cleanup(struct wlrdp_encoder *enc)
 {
     if (enc->nsc_stream) {
         Stream_Free(enc->nsc_stream, TRUE);
@@ -136,522 +147,204 @@ static void nsc_cleanup(struct wlrdp_encoder *enc)
         nsc_context_free(enc->nsc_ctx);
         enc->nsc_ctx = NULL;
     }
-    free(enc->conv_buf);
-    enc->conv_buf = NULL;
-    enc->conv_size = 0;
 }
 
-/* --- H.264 helpers --- */
-
-#ifdef WLRDP_HAVE_H264
-
-static bool h264_try_encoder(struct wlrdp_encoder *enc, const char *name,
-                             struct h264_ctx *hctx)
+static bool
+h264_init(struct wlrdp_encoder *enc)
 {
-    const AVCodec *codec = avcodec_find_encoder_by_name(name);
-    if (!codec) {
-        WLRDP_LOG_INFO("H.264 encoder '%s' not found", name);
+    enc->h264_ctx = h264_context_new(TRUE);
+    if (!enc->h264_ctx) {
+        WLRDP_LOG_ERROR("failed to create FreeRDP H.264 context");
         return false;
     }
 
-    /* Many H.264 encoders (especially libx264 and hardware ones)
-     * require even dimensions for YUV420. */
-    uint32_t enc_width = enc->width & ~1;
-    uint32_t enc_height = enc->height & ~1;
+    h264_context_set_option(enc->h264_ctx, H264_CONTEXT_OPTION_HW_ACCEL,
+                            PREFER_HW_H264 ? TRUE : FALSE);
+    h264_context_set_option(enc->h264_ctx, H264_CONTEXT_OPTION_RATECONTROL,
+                            H264_RATECONTROL_CQP);
+    h264_context_set_option(enc->h264_ctx, H264_CONTEXT_OPTION_BITRATE, 4000000);
+    h264_context_set_option(enc->h264_ctx, H264_CONTEXT_OPTION_FRAMERATE, 30);
+    h264_context_set_option(enc->h264_ctx, H264_CONTEXT_OPTION_QP, 22);
+    h264_context_set_option(enc->h264_ctx, H264_CONTEXT_OPTION_USAGETYPE,
+                            H264_SCREEN_CONTENT_REAL_TIME);
 
-    AVCodecContext *ctx = avcodec_alloc_context3(codec);
-    if (!ctx) return false;
-
-    ctx->width = enc_width;
-    ctx->height = enc_height;
-    ctx->time_base = (AVRational){1, 30};
-    ctx->framerate = (AVRational){30, 1};
-    ctx->gop_size = 60;        /* keyframe every 2 seconds at 30fps */
-    ctx->max_b_frames = 0;     /* RDP doesn't benefit from B-frames */
-    ctx->bit_rate = enc_width * enc_height * 2; /* ~2 bits/pixel */
-    ctx->thread_count = 1;     /* single-threaded for low latency */
-
-    if (strcmp(name, "h264_vaapi") == 0) {
-        ctx->pix_fmt = AV_PIX_FMT_VAAPI;
-    } else {
-        ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    }
-
-    /* Apply encoder-specific low-latency tuning */
-    if (strcmp(name, "libx264") == 0) {
-        av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
-        av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
-        av_opt_set(ctx->priv_data, "profile", "high", 0);
-        /* x264-params string forces High profile + SPS/VUI (overrides "ultrafast" preset
-         * limitations on ARM libx264). This fixes the black screen on MS RDP with AVC444v2.
-         * (mstsc decoder requires exact SPS; xfreerdp was lenient). Matches FreeRDP shadow. */
-        av_opt_set(ctx->priv_data, "8x8dct", "1", 0);
-        av_opt_set(ctx->priv_data, "cabac", "1", 0);
-    } else if (strcmp(name, "h264_nvenc") == 0) {
-        av_opt_set(ctx->priv_data, "preset", "p1", 0); /* p1 = fastest */
-        av_opt_set(ctx->priv_data, "tune", "ull", 0);  /* ull = ultra low latency */
-        av_opt_set(ctx->priv_data, "delay", "0", 0);
-    } else if (strcmp(name, "h264_vaapi") == 0) {
-        /* VAAPI often uses its own profile/entrypoint settings */
-    }
-
-    if (avcodec_open2(ctx, codec, NULL) < 0) {
-        WLRDP_LOG_INFO("H.264 encoder '%s' failed to open", name);
-        avcodec_free_context(&ctx);
+    if (!h264_context_reset(enc->h264_ctx, enc->width, enc->height)) {
+        WLRDP_LOG_ERROR("failed to reset FreeRDP H.264 context");
+        h264_context_free(enc->h264_ctx);
+        enc->h264_ctx = NULL;
         return false;
     }
 
-    /* VAAPI requires hardware frame allocation, which we don't support yet.
-     * For now, if vaapi was selected, we fail and try the next one. */
-    if (ctx->pix_fmt == AV_PIX_FMT_VAAPI) {
-        WLRDP_LOG_INFO("H.264 encoder '%s' requires VAAPI hardware frames (unsupported)", name);
-        avcodec_free_context(&ctx);
-        return false;
-    }
-
-    AVFrame *frame = av_frame_alloc();
-    if (!frame) {
-        avcodec_free_context(&ctx);
-        return false;
-    }
-    frame->format = ctx->pix_fmt;
-    frame->width = ctx->width;
-    frame->height = ctx->height;
-    if (av_frame_get_buffer(frame, 0) < 0) {
-        av_frame_free(&frame);
-        avcodec_free_context(&ctx);
-        return false;
-    }
-
-    AVPacket *pkt = av_packet_alloc();
-    if (!pkt) {
-        av_frame_free(&frame);
-        avcodec_free_context(&ctx);
-        return false;
-    }
-
-    struct SwsContext *sws = sws_getContext(
-        enc->width, enc->height, AV_PIX_FMT_BGRA,
-        ctx->width, ctx->height, ctx->pix_fmt,
-        SWS_FAST_BILINEAR, NULL, NULL, NULL);
-    if (!sws) {
-        av_packet_free(&pkt);
-        av_frame_free(&frame);
-        avcodec_free_context(&ctx);
-        return false;
-    }
-
-    hctx->codec_ctx = ctx;
-    hctx->frame = frame;
-    hctx->packet = pkt;
-    hctx->sws_ctx = sws;
-
-    WLRDP_LOG_INFO("H.264 encoder '%s' opened (%ux%u -> %ux%u)",
-                    name, enc->width, enc->height, ctx->width, ctx->height);
+    enc->mode = WLRDP_ENCODER_H264_FREERDP;
+    WLRDP_LOG_INFO("encoder initialized (%ux%u, FreeRDP H.264, hw preference: %s)",
+                   enc->width, enc->height, PREFER_HW_H264 ? "enabled" : "disabled");
     return true;
 }
 
-static bool h264_init(struct wlrdp_encoder *enc)
+static bool
+h264_encode(struct wlrdp_encoder *enc, const uint8_t *pixels, uint32_t stride)
 {
-    /* Try hardware encoders first, then software */
-    static const char *encoders[] = {
-        "h264_vaapi",
-        "h264_nvenc",
-        "libx264",
-        NULL,
+    RECTANGLE_16 region = {
+        .left = 0,
+        .top = 0,
+        .right = (UINT16)enc->width,
+        .bottom = (UINT16)enc->height,
+    };
+    INT32 rc;
+
+    encoder_clear_h264_metadata(enc);
+    enc->out_buf = NULL;
+    enc->out_len = 0;
+    enc->aux_buf = NULL;
+    enc->aux_len = 0;
+    enc->avc444_lc = 0;
+
+    if (enc->avc444_version != 0) {
+        rc = avc444_compress(enc->h264_ctx, pixels, PIXEL_FORMAT_BGRX32,
+                             stride, enc->width, enc->height,
+                             enc->avc444_version, &region,
+                             &enc->avc444_lc, &enc->out_buf, &enc->out_len,
+                             &enc->aux_buf, &enc->aux_len, &enc->h264_meta,
+                             &enc->h264_aux_meta);
+    } else {
+        rc = avc420_compress(enc->h264_ctx, pixels, PIXEL_FORMAT_BGRX32,
+                             stride, enc->width, enc->height, &region,
+                             &enc->out_buf, &enc->out_len, &enc->h264_meta);
+    }
+
+    if (rc < 0) {
+        WLRDP_LOG_ERROR("FreeRDP H.264 compression failed");
+        encoder_clear_h264_metadata(enc);
+        return false;
+    }
+
+    enc->is_keyframe = true;
+    return true;
+}
+
+static bool
+progressive_init(struct wlrdp_encoder *enc)
+{
+    enc->prog_ctx = progressive_context_new(TRUE);
+    if (!enc->prog_ctx) {
+        WLRDP_LOG_ERROR("failed to create FreeRDP Progressive context");
+        return false;
+    }
+
+    if (progressive_create_surface_context(enc->prog_ctx, 1, enc->width,
+                                           enc->height) < 0) {
+        WLRDP_LOG_ERROR("failed to create Progressive surface context");
+        progressive_context_free(enc->prog_ctx);
+        enc->prog_ctx = NULL;
+        return false;
+    }
+
+    enc->mode = WLRDP_ENCODER_PROGRESSIVE;
+    WLRDP_LOG_INFO("encoder initialized (%ux%u, Progressive)", enc->width,
+                   enc->height);
+    return true;
+}
+
+static bool
+progressive_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
+                   uint32_t stride)
+{
+    REGION16 invalid;
+    RECTANGLE_16 rect = {
+        .left = 0,
+        .top = 0,
+        .right = (UINT16)enc->width,
+        .bottom = (UINT16)enc->height,
     };
 
-    for (int i = 0; encoders[i]; i++) {
-        if (h264_try_encoder(enc, encoders[i], &enc->h264[0])) {
-            enc->mode = WLRDP_ENCODER_H264;
-            WLRDP_LOG_INFO("encoder initialized (%ux%u, H.264 via %s)",
-                            enc->width, enc->height, encoders[i]);
-            return true;
-        }
-    }
-
-    WLRDP_LOG_WARN("no H.264 encoder available, falling back to NSCodec");
-    return false;
-}
-
-/*
- * Encode a frame using a single H.264 context. The caller must have already
- * filled hctx->frame->data with YUV420P planes. Sets *out and *out_len to
- * the encoded NAL units. Returns true on success.
- */
-static bool h264_ctx_encode(struct h264_ctx *hctx, int64_t pts,
-                            uint8_t **out, uint32_t *out_len, bool *keyframe)
-{
-    AVCodecContext *ctx = hctx->codec_ctx;
-    AVFrame *frame = hctx->frame;
-    AVPacket *pkt = hctx->packet;
-
-    frame->pts = pts;
-
-    int ret = avcodec_send_frame(ctx, frame);
-    if (ret < 0) {
-        WLRDP_LOG_ERROR("avcodec_send_frame failed: %d", ret);
+    region16_init(&invalid);
+    if (!region16_union_rect(&invalid, &invalid, &rect)) {
+        region16_uninit(&invalid);
         return false;
     }
 
-    ret = avcodec_receive_packet(ctx, pkt);
-    if (ret == AVERROR(EAGAIN)) {
-        *out_len = 0;
-        return true;
-    }
-    if (ret < 0) {
-        WLRDP_LOG_ERROR("avcodec_receive_packet failed: %d", ret);
+    INT32 rc = progressive_compress(enc->prog_ctx, pixels, stride * enc->height,
+                                    PIXEL_FORMAT_BGRX32, enc->width, enc->height,
+                                    stride, &invalid, &enc->out_buf,
+                                    &enc->out_len);
+    region16_uninit(&invalid);
+
+    if (rc < 0) {
+        WLRDP_LOG_ERROR("Progressive compression failed");
+        enc->out_buf = NULL;
+        enc->out_len = 0;
         return false;
     }
 
-    *out = pkt->data;
-    *out_len = pkt->size;
-    *keyframe = !!(pkt->flags & AV_PKT_FLAG_KEY);
+    enc->aux_buf = NULL;
+    enc->aux_len = 0;
+    enc->is_keyframe = true;
     return true;
 }
 
-static bool h264_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
-                        uint32_t stride)
-{
-    struct h264_ctx *hctx = &enc->h264[0];
-    AVCodecContext *ctx = hctx->codec_ctx;
-    AVFrame *frame = hctx->frame;
-    struct SwsContext *sws = hctx->sws_ctx;
-
-    /* Convert BGRX -> YUV420P */
-    const uint8_t *src_data[1] = { pixels };
-    int src_linesize[1] = { (int)stride };
-
-    if (av_frame_make_writable(frame) < 0) {
-        WLRDP_LOG_ERROR("av_frame_make_writable failed");
-        return false;
-    }
-
-    sws_scale(sws, src_data, src_linesize, 0, enc->height,
-              frame->data, frame->linesize);
-
-    return h264_ctx_encode(hctx, ctx->frame_num,
-                           &enc->out_buf, &enc->out_len, &enc->is_keyframe);
-}
-
-static void h264_ctx_cleanup(struct h264_ctx *hctx)
-{
-    if (hctx->sws_ctx) {
-        sws_freeContext(hctx->sws_ctx);
-        hctx->sws_ctx = NULL;
-    }
-    if (hctx->packet) {
-        av_packet_free((AVPacket **)&hctx->packet);
-    }
-    if (hctx->frame) {
-        av_frame_free((AVFrame **)&hctx->frame);
-    }
-    if (hctx->codec_ctx) {
-        avcodec_free_context((AVCodecContext **)&hctx->codec_ctx);
-    }
-}
-
-static void h264_cleanup(struct wlrdp_encoder *enc)
-{
-    h264_ctx_cleanup(&enc->h264[0]);
-    h264_ctx_cleanup(&enc->h264[1]);
-}
-
-static void avc444_cleanup_buffers(struct wlrdp_encoder *enc)
-{
-    for (int i = 0; i < 3; i++) {
-        free(enc->yuv_main[i]);
-        enc->yuv_main[i] = NULL;
-        free(enc->yuv_aux[i]);
-        enc->yuv_aux[i] = NULL;
-    }
-    free(enc->aligned_buf);
-    enc->aligned_buf = NULL;
-    enc->aligned_stride = 0;
-}
-
-static bool avc444_init(struct wlrdp_encoder *enc)
-{
-    /* Software encoder only for AVC444. Hardware encoders (vaapi/nvenc)
-     * are not suitable for the dual YUV420 streams produced by
-     * FreeRDP's RGBToAVC444YUV primitive (no hardware frame support,
-     * incompatible with chroma refinement data). */
-    static const char *encoders[] = {
-        "libx264",
-        NULL,
-    };
-
-    const char *chosen = NULL;
-    for (int i = 0; encoders[i]; i++) {
-        if (h264_try_encoder(enc, encoders[i], &enc->h264[0])) {
-            chosen = encoders[i];
-            break;
-        }
-    }
-
-    if (!chosen) {
-        WLRDP_LOG_WARN("no H.264 encoder for AVC444 main stream");
-        return false;
-    }
-
-    /* Open a second encoder instance for the aux/chroma stream */
-    if (!h264_try_encoder(enc, chosen, &enc->h264[1])) {
-        WLRDP_LOG_WARN("failed to open second H.264 encoder for AVC444 aux stream");
-        h264_ctx_cleanup(&enc->h264[0]);
-        return false;
-    }
-
-    /* Check for the required primitive (may not be available or may crash on some builds).
-     * Fallback to AVC420 (single H.264 stream) for Mac Microsoft Remote Desktop
-     * (VideoToolbox) or if primitive missing — prevents segfault/black screen. */
-    primitives_t *prims = primitives_get();
-    if (!prims || !prims->RGBToAVC444YUV) {
-        WLRDP_LOG_WARN("RGBToAVC444YUV primitive not available, falling back to AVC420");
-        h264_ctx_cleanup(&enc->h264[0]);
-        h264_ctx_cleanup(&enc->h264[1]);
-        return false;
-    }
-
-    /* Allocate YUV plane buffers for RGBToAVC444YUV output.
-     * Use aligned strides (multiple of 16) to prevent BUS ERROR on ARM NEON in the
-     * primitive and copy loop. ROI uses the original size; padding is zeroed. */
-    uint32_t w = enc->width & ~1;
-    uint32_t h = enc->height & ~1;
-    uint32_t y_stride = (w + 15) & ~15;
-    uint32_t uv_stride = ((w / 2) + 15) & ~15;
-
-    enc->yuv_stride[0] = y_stride;
-    enc->yuv_stride[1] = uv_stride;
-    enc->yuv_stride[2] = uv_stride;
-
-    for (int i = 0; i < 3; i++) {
-        uint32_t plane_stride = enc->yuv_stride[i];
-        uint32_t plane_height = (i == 0) ? h : h / 2;
-        size_t plane_size = (size_t)plane_stride * plane_height;
-
-        enc->yuv_main[i] = calloc(1, plane_size);
-        enc->yuv_aux[i] = calloc(1, plane_size);
-
-        if (!enc->yuv_main[i] || !enc->yuv_aux[i]) {
-            WLRDP_LOG_ERROR("failed to allocate AVC444 YUV buffers");
-            avc444_cleanup_buffers(enc);
-            h264_ctx_cleanup(&enc->h264[0]);
-            h264_ctx_cleanup(&enc->h264[1]);
-            return false;
-        }
-    }
-
-    /* Aligned input buffer for the primitive (fixes ARM NEON bus error on unaligned
-     * screencopy buffers from wlr-screencopy). Stride multiple of 64 for safety. */
-    uint32_t bpp = 4; /* BGRX32 */
-    enc->aligned_stride = (enc->width * bpp + 63) & ~63;
-    size_t aligned_size = (size_t)enc->aligned_stride * enc->height;
-    enc->aligned_buf = malloc(aligned_size);
-    if (!enc->aligned_buf) {
-        WLRDP_LOG_ERROR("failed to allocate aligned buffer for primitive");
-        avc444_cleanup_buffers(enc);
-        h264_ctx_cleanup(&enc->h264[0]);
-        h264_ctx_cleanup(&enc->h264[1]);
-        return false;
-    }
-    memset(enc->aligned_buf, 0, aligned_size);
-
-    enc->mode = WLRDP_ENCODER_AVC444;
-    WLRDP_LOG_INFO("encoder initialized (%ux%u, AVC444%s via %s)",
-                    enc->width, enc->height,
-                    enc->avc444v2 ? "v2" : "", chosen);
-    return true;
-}
-
-static bool avc444_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
-                          uint32_t stride)
-{
-    primitives_t *prims = primitives_get();
-    uint32_t w = enc->width & ~1;
-    uint32_t h = enc->height & ~1;
-
-    enc->frame_count++;
-    bool force_keyframe = (enc->frame_count <= 5); /* Force IDR/SPS/PPS for first frames (fixes init/decode; flashes on mouse move indicate stale first frames) */
-
-    if (!enc->aligned_buf) {
-        WLRDP_LOG_ERROR("aligned_buf not allocated");
-        return false;
-    }
-
-    /* Copy capture buffer (top-down BGRX32 from screencopy) to aligned buffer for the primitive.
-     * This fixes ARM NEON bus error. */
-    for (uint32_t y = 0; y < h; y++) {
-        memcpy(enc->aligned_buf + (size_t)y * enc->aligned_stride,
-               pixels + (size_t)y * (size_t)stride, (size_t)w * 4);
-    }
-
-    prim_size_t roi = { .width = w, .height = h };
-    UINT32 main_step[3] = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
-    UINT32 aux_step[3]  = { enc->yuv_stride[0], enc->yuv_stride[1], enc->yuv_stride[2] };
-
-    /* Zero YUV buffers on early frames to ensure clean init (primitive should overwrite, but this eliminates any stale data causing color/init errors). */
-    if (force_keyframe) {
-        for (int i = 0; i < 3; i++) {
-            uint32_t plane_h = (i == 0) ? h : h / 2;
-            size_t plane_size = (size_t)enc->yuv_stride[i] * plane_h;
-            memset(enc->yuv_main[i], 0, plane_size);
-            memset(enc->yuv_aux[i], 0, plane_size);
-        }
-        encoder_request_keyframe(enc); /* Force IDR/SPS/PPS on early frames (addresses init error; mouse-move flashes indicate first frames were ignored by decoder) */
-    }
-
-    /* Split BGRX into main (base YUV420) + aux (chroma refinement YUV420) */
-    /* Note: capture uses XRGB8888 (0xXXRRGGBB); on LE this is B,G,R,X in memory, which matches PIXEL_FORMAT_BGRX32. */
-    pstatus_t prc;
-    if (enc->avc444v2) {
-        prc = prims->RGBToAVC444YUVv2(enc->aligned_buf, PIXEL_FORMAT_BGRX32, enc->aligned_stride,
-                                       enc->yuv_main, main_step,
-                                       enc->yuv_aux, aux_step, &roi);
-    } else {
-        prc = prims->RGBToAVC444YUV(enc->aligned_buf, PIXEL_FORMAT_BGRX32, enc->aligned_stride,
-                                     enc->yuv_main, main_step,
-                                     enc->yuv_aux, aux_step, &roi);
-    }
-
-    if (prc != PRIMITIVES_SUCCESS) {
-        WLRDP_LOG_ERROR("RGBToAVC444YUV%s failed: %d",
-                        enc->avc444v2 ? "v2" : "", (int)prc);
-        return false;
-    }
-
-    /* Copy YUV planes into encoder frames */
-    for (int stream = 0; stream < 2; stream++) {
-        struct h264_ctx *hctx = &enc->h264[stream];
-        AVFrame *frame = hctx->frame;
-        uint8_t **yuv = (stream == 0) ? enc->yuv_main : enc->yuv_aux;
-
-        if (av_frame_make_writable(frame) < 0) {
-            WLRDP_LOG_ERROR("av_frame_make_writable failed (stream %d)", stream);
-            return false;
-        }
-
-        /* Copy each plane (Y, U, V) row by row. Zero padding to prevent
-         * garbage bytes from being encoded (AVFrame linesize includes
-         * alignment padding; primitive uses tight strides). This fixes
-         * color artifacts, decode failures (black screen on MS RDP), and
-         * related rendering issues. */
-        for (int p = 0; p < 3; p++) {
-            uint32_t plane_h = (p == 0) ? h : h / 2;
-            uint32_t src_stride = enc->yuv_stride[p];
-            uint32_t dst_stride = frame->linesize[p];
-            uint32_t copy_width = (p == 0) ? w : w / 2;
-
-            for (uint32_t row = 0; row < plane_h; row++) {
-                uint8_t *dst = frame->data[p] + row * (size_t)dst_stride;
-                uint8_t *src = yuv[p] + row * (size_t)src_stride;
-                memcpy(dst, src, copy_width);
-                if (dst_stride > copy_width) {
-                    memset(dst + copy_width, 0, dst_stride - copy_width);
-                }
-            }
-        }
-    }
-
-    /* Encode main stream */
-    AVCodecContext *main_ctx = enc->h264[0].codec_ctx;
-    if (!h264_ctx_encode(&enc->h264[0], main_ctx->frame_num,
-                         &enc->out_buf, &enc->out_len, &enc->is_keyframe)) {
-        return false;
-    }
-
-    /* Encode aux stream */
-    AVCodecContext *aux_ctx = enc->h264[1].codec_ctx;
-    bool aux_key;
-    if (!h264_ctx_encode(&enc->h264[1], aux_ctx->frame_num,
-                         &enc->aux_buf, &enc->aux_len, &aux_key)) {
-        return false;
-    }
-
-    return true;
-}
-
-#endif /* WLRDP_HAVE_H264 */
-
-/* --- Public API --- */
-
-bool encoder_init(struct wlrdp_encoder *enc, enum wlrdp_encoder_mode mode,
-                  uint32_t width, uint32_t height, bool avc444v2, uint32_t format)
+bool
+encoder_init(struct wlrdp_encoder *enc, enum wlrdp_encoder_mode mode,
+             uint32_t width, uint32_t height, uint8_t avc444_version,
+             uint32_t format)
 {
     memset(enc, 0, sizeof(*enc));
     enc->width = width;
     enc->height = height;
     enc->format = format;
-    enc->frame_count = 0;
-    if (mode == WLRDP_ENCODER_AVC444) {
-        enc->avc444v2 = avc444v2;
-    }
+    enc->avc444_version = avc444_version;
 
-#ifdef WLRDP_HAVE_H264
-    if (mode == WLRDP_ENCODER_AVC444) {
-        if (avc444_init(enc)) {
-            return true;
-        }
-        /* AVC444 failed — try plain AVC420 before NSCodec */
-        mode = WLRDP_ENCODER_H264;
-    }
-    if (mode == WLRDP_ENCODER_H264) {
-        if (h264_init(enc)) {
-            return true;
-        }
-    }
-#else
-    if (mode == WLRDP_ENCODER_H264 || mode == WLRDP_ENCODER_AVC444) {
-        WLRDP_LOG_WARN("H.264 not compiled in, falling back to NSCodec or RAW");
-    }
-#endif
+    if (mode == WLRDP_ENCODER_H264_FREERDP && h264_init(enc))
+        return true;
 
-    if (mode == WLRDP_ENCODER_NSC) {
-        if (nsc_init(enc)) {
-            return true;
-        }
-    }
+    if (mode == WLRDP_ENCODER_PROGRESSIVE && progressive_init(enc))
+        return true;
+
+    if (mode == WLRDP_ENCODER_NSAC && nsc_init(enc))
+        return true;
 
     return raw_init(enc);
 }
 
-bool encoder_encode(struct wlrdp_encoder *enc, const uint8_t *pixels,
-                    uint32_t stride)
+bool
+encoder_encode(struct wlrdp_encoder *enc, const uint8_t *pixels, uint32_t stride)
 {
-#ifdef WLRDP_HAVE_H264
-    if (enc->mode == WLRDP_ENCODER_AVC444) {
-        return avc444_encode(enc, pixels, stride);
-    }
-    if (enc->mode == WLRDP_ENCODER_H264) {
+    switch (enc->mode) {
+    case WLRDP_ENCODER_H264_FREERDP:
         return h264_encode(enc, pixels, stride);
-    }
-#endif
-    if (enc->mode == WLRDP_ENCODER_NSC) {
+    case WLRDP_ENCODER_PROGRESSIVE:
+        return progressive_encode(enc, pixels, stride);
+    case WLRDP_ENCODER_NSAC:
         return nsc_encode(enc, pixels, stride);
+    case WLRDP_ENCODER_RAW:
+    default:
+        return raw_encode(enc, pixels, stride);
     }
-    return raw_encode(enc, pixels, stride);
 }
 
-void encoder_request_keyframe(struct wlrdp_encoder *enc)
+void
+encoder_request_keyframe(struct wlrdp_encoder *enc)
 {
-#ifdef WLRDP_HAVE_H264
-    if ((enc->mode == WLRDP_ENCODER_H264 || enc->mode == WLRDP_ENCODER_AVC444)
-        && enc->h264[0].frame) {
-        ((AVFrame *)enc->h264[0].frame)->pict_type = AV_PICTURE_TYPE_I;
-    }
-    if (enc->mode == WLRDP_ENCODER_AVC444 && enc->h264[1].frame) {
-        ((AVFrame *)enc->h264[1].frame)->pict_type = AV_PICTURE_TYPE_I;
-    }
-#else
-    (void)enc;
-#endif
+    if (enc->mode == WLRDP_ENCODER_H264_FREERDP && enc->h264_ctx)
+        h264_context_reset(enc->h264_ctx, enc->width, enc->height);
+    else if (enc->mode == WLRDP_ENCODER_PROGRESSIVE && enc->prog_ctx)
+        progressive_context_reset(enc->prog_ctx);
 }
 
-void encoder_destroy(struct wlrdp_encoder *enc)
+void
+encoder_destroy(struct wlrdp_encoder *enc)
 {
-#ifdef WLRDP_HAVE_H264
-    h264_cleanup(enc);
-    avc444_cleanup_buffers(enc);
-#endif
+    encoder_clear_h264_metadata(enc);
+
+    if (enc->h264_ctx) {
+        h264_context_free(enc->h264_ctx);
+        enc->h264_ctx = NULL;
+    }
+    if (enc->prog_ctx) {
+        progressive_delete_surface_context(enc->prog_ctx, 1);
+        progressive_context_free(enc->prog_ctx);
+        enc->prog_ctx = NULL;
+    }
+
     nsc_cleanup(enc);
     raw_cleanup(enc);
     memset(enc, 0, sizeof(*enc));

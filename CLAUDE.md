@@ -16,7 +16,7 @@ meson setup build
 meson compile -C build
 
 # Reconfigure with options
-meson configure build -Denable-h264=enabled
+meson configure build -Denable-h264=enabled -Dprefer_hardware_h264=enabled
 
 # Clean rebuild
 meson setup --wipe build
@@ -58,5 +58,27 @@ Meson with C11. Wayland protocol C bindings are generated at build time via `way
 
 - This is a Linux-only project (epoll, SCM_RIGHTS, PAM). Development requires a Linux environment or the provided devcontainer.  If the host system is MacOS and Claude is not running in VSCode, use MCP tools to start, rebuild, restart, or run commands inside the devcontainer.
 - If xfreerdp is available on the host system, test the server with the following command: `xfreerdp /u:developer /p:developer /cert:ignore /v:localhost /gfx:AVC420`
-- H.264 encoding and PipeWire capture are planned but currently disabled (`meson_options.txt`).
+- H.264 encoding uses FreeRDP's codec APIs. Use `-Dprefer_hardware_h264=disabled`
+  to request software-only H.264.
 - Frame data uses raw BGRX pixels (no compression yet); the vertical flip in `session/main.c:on_frame_ready` is needed because screencopy gives top-down but SurfaceBits expects bottom-up.
+
+## H.264 Options
+
+Prefer hardware H.264 encoding:
+
+```bash
+meson setup --wipe build -Denable-h264=enabled -Dprefer_hardware_h264=enabled
+```
+
+Request software H.264 encoding:
+
+```bash
+meson setup --wipe build -Denable-h264=enabled -Dprefer_hardware_h264=disabled
+```
+
+Manual client checks:
+
+```bash
+xfreerdp /u:developer /p:developer /cert:ignore /v:localhost /gfx:AVC420
+xfreerdp /u:developer /p:developer /cert:ignore /v:localhost /gfx:AVC444
+```

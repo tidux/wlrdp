@@ -13,3 +13,8 @@ default_height = 600
 
 [security]
 max_sessions = 50
+
+[encoder]
+# Prefer hardware H.264 when the FreeRDP codec backend supports it.
+# Set to false in deployments that need software-only encoding.
+hardware_h264 = true
